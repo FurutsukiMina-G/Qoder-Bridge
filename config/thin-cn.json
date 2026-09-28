@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "qoder-context@qoderapp-bundler": false
+  },
+  "skillOverrides": {
+    "qoder-context:qoder-context-knowledge-plan": "off"
+  }
+}

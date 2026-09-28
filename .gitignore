@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.npm-cache/
+.runtime/
+reports/
+.env
+.env.*
+!.env.example
+
+# Machine-local notes and scripts bound to real Harness sessions or tasks.
+local/
+scripts/audit-acg-task.ts
+scripts/audit-current-run.ts
+scripts/audit-recent-runs.ts
+scripts/replay-bad-decisions.ts
+scripts/verify-upgrade.ts
+
+# Never commit logs, usage records, or credentials even if written outside the folders above.
+*.log
+*.ndjson
+bridge-key
+*.pem
+*.key
+*.pfx
+dsh-connection.json

@@ -1,0 +1,46 @@
+{
+  "name": "qoderbridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local OpenAI-compatible bridge serving Qoder CN DeepSeek models to DeepSeek Harness through the official Qoder SDK",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "qoderbridge": "dist/src/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "dev": "tsx src/main.ts",
+    "probe": "tsx src/main.ts probe",
+    "gate": "tsx src/main.ts gate",
+    "action": "tsx src/main.ts action",
+    "serve": "tsx src/main.ts serve --session-settings config/thin-cn.json --timeout 300000",
+    "bridge:smoke": "tsx scripts/bridge-smoke.ts",
+    "stream:smoke": "tsx scripts/streaming-smoke.ts",
+    "metrics": "tsx scripts/metrics.ts",
+    "models": "tsx src/main.ts models",
+    "qoder:login": "node scripts/qoder-cli.mjs login",
+    "qoder:models": "node scripts/qoder-cli.mjs --list-models",
+    "qoder:tui": "node scripts/qoder-cli.mjs",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "report": "tsx scripts/summarize.ts",
+    "tasks:report": "tsx scripts/tasks-report.ts",
+    "balance": "tsx scripts/balance.ts",
+    "monitor": "tsx scripts/monitor-dsh.ts",
+    "status": "tsx scripts/status.ts"
+  },
+  "dependencies": {
+    "@qodercn-ai/qodercn-agent-sdk": "1.0.50",
+    "ajv": "8.20.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}
