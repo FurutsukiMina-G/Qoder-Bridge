@@ -33,7 +33,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
-  'attributed_call_envelope'; tool: string; parameter: string };
+  'attributed_call_envelope' | 'redundant_decision_closers'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -593,7 +593,13 @@ function missingCallClosures(text: string): { value: unknown; repairs: DecisionR
         repairs.push({ kind: 'decision_wrapper_close', tool: name, parameter: 'calls' });
         return { value: { kind: 'tool_calls', calls }, repairs };
       }
-      if (!/^\]\s*\}\s*$/.test(text.slice(cursor)) || !repairs.length) return null;
+      const tail = text.slice(cursor);
+      // Observed output omits a call's close and then repeats the array/root
+      // closing pair. Every arguments object above must already be complete;
+      // tolerate only this exact empty tail, never another call or any data.
+      const duplicatedClosers = /^\]\s*\}\s*\]\s*\}\s*$/.test(tail);
+      if ((!/^\]\s*\}\s*$/.test(tail) && !duplicatedClosers) || !repairs.length) return null;
+      if (duplicatedClosers) repairs.push({ kind: 'redundant_decision_closers', tool: name, parameter: 'calls' });
       return { value: { kind: 'tool_calls', calls }, repairs };
     }
   } catch { return null; }

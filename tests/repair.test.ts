@@ -409,6 +409,35 @@ test('the complete DSML calls parameter uses the same bounded missing-call-wrapp
   assert.throws(()=>parseDecision(source,ChatRequest.parse({...request,tool_choice:'none'})),/forbids/);
 });
 
+test('a missing call close with one duplicated decision tail preserves both complete commands', () => {
+  const calls = [
+    { name: 'pwsh', arguments: { command: 'Write-Output "literal ]} and quote"', description: 'first', workdir: 'D:\\fixture' } },
+    { name: 'pwsh', arguments: { command: 'Get-Date\nGet-Location', description: 'second', workdir: 'D:\\fixture' } },
+  ];
+  const source = JSON.stringify({ kind: 'tool_calls', calls }).slice(0, -3) + ']}]}';
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision(source, pwshRequest, repair => repairs.push(repair)), { kind: 'tool_calls', calls });
+  assert.deepEqual(repairs.map(repair => repair.kind), ['call_wrapper_close', 'redundant_decision_closers']);
+});
+
+test('duplicated tail recovery rejects extra data, incomplete arguments, invalid calls and forbidden tools', () => {
+  const full = JSON.stringify({ kind: 'tool_calls', calls: [
+    { name: 'pwsh', arguments: { command: 'Get-Date', description: 'first' } },
+    { name: 'pwsh', arguments: { command: 'Get-Location', description: 'second' } },
+  ] });
+  const source = full.slice(0, -3) + ']}]}';
+  for (const invalid of [source + ' more data', source + ']}', source.replace(']}]}', '],{}]}'),
+    full.slice(0, -4) + ']}]}', source.replace('"description":"second"', '"unknown":"second"'),
+    source.replace('"command":"Get-Location"', '"command":42'),
+    source.replace('"Get-Location"', '"truncated')]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(invalid, pwshRequest, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...pwshRequest, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(source.replace('"name":"pwsh"', '"name":"unknown"'), pwshRequest), /Unknown/);
+});
+
 test('missing final array and decision closes recover only complete call objects with unchanged arguments', () => {
   const first = { name: 'grep', arguments: { pattern: 'first' } };
   const second = { name: 'grep', arguments: { pattern: 'second' } };
