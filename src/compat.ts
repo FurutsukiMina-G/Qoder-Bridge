@@ -537,10 +537,11 @@ function genericShorthandNameDecision(text: string, request: ChatRequest, repair
   try { args = objectRange(text, start.index + start[0].length); }
   catch { return null; } // Let the normal parser reject malformed arguments.
   const tail = text.slice(args.end);
-  if (!/^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name"/.test(tail)) return null;
+  if (!/^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name(?:"|=)/.test(tail)) return null;
   // The name is an explicit, separately closed field after an entire JSON
   // arguments object. Do not scan or rewrite any protocol text inside args.
-  const name = /^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name"\s+string="true">([A-Za-z_][\w.-]*)<\/｜｜DSML｜｜\s*parameter>\s*(?:<\/｜｜DSML｜｜\s*invoke>\s*)?<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(tail);
+  const name = /^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name"\s+string="true">([A-Za-z_][\w.-]*)<\/｜｜DSML｜｜\s*parameter>\s*(?:<\/｜｜DSML｜｜\s*invoke>\s*)?<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(tail) ??
+    /^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name="([A-Za-z_][\w.-]*)"｜｜DSML｜｜\s*parameter>\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(tail);
   if (!name || name[2] !== start[1]) throw new Error('Generic DSML shorthand name has extra or incomplete boundaries');
   if (request.tools?.some(tool => tool.function.name === 'tool_call'))
     throw new Error('Generic DSML wrapper conflicts with a supplied tool');
