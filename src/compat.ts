@@ -33,7 +33,8 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
-  'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener'; tool: string; parameter: string };
+  'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
+  'missing_calls_parameter_wrapper'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -483,6 +484,24 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   return Decision.parse(parsed.length === 1 ? { kind: 'tool_call', ...parsed[0] } :
     { kind: 'tool_calls', calls: parsed });
 }
+function callsParameterDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
+  const start = /<｜｜DSML｜｜\s*parameter\s+name="calls"[^>]*>/.exec(text);
+  if (!start || /｜｜(?:DSML|DS)｜｜|<\/?custom_tool_call\b/.test(text.slice(0, start.index))) return null;
+  if (!/^<｜｜DSML｜｜\s*parameter\s+name="calls"\s+string="false"\s*>$/.test(start[0]))
+    throw new Error('Unwrapped DSML calls parameter must contain an explicit JSON array');
+  let at = start.index + start[0].length;
+  while (at < text.length && /\s/.test(text[at]!)) at++;
+  const array = arrayRange(text, at);
+  // Both open wrappers were omitted, but their complete closing boundaries
+  // remain. Parse the entire array before inspecting tags so protocol-looking
+  // strings inside arguments stay data. Never close a truncated array or call.
+  if (!/^\s*<\/｜｜DSML｜｜\s*parameter>\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(?:calls|tool_calls)>\s*$/.test(text.slice(array.end)))
+    throw new Error('Unwrapped DSML calls parameter has extra or incomplete closing data');
+  const decision = decisionObject({ kind: 'tool_calls', calls: array.value }, request, repairs);
+  if (decision.kind !== 'tool_calls') throw new Error('Unwrapped DSML calls parameter is invalid');
+  repairs.push({ kind: 'missing_calls_parameter_wrapper', tool: 'wrapper', parameter: 'calls' });
+  return decision.calls.length === 1 ? { kind: 'tool_call', ...decision.calls[0]! } : decision;
+}
 function missingCallsOpener(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
   const start = /<｜｜DSML｜｜\s*invoke\s+name="([A-Za-z_][\w.-]*)">/.exec(text);
   if (!start) return null;
@@ -714,13 +733,13 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const source = fenced?.[1] ?? trimmed;
   const repairs: DecisionRepair[] = [];
   const jsonAt = source.search(/\{\s*"kind"\s*:\s*"(?:tool_calls|tool_call|final)"/);
-  const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜DSML｜｜\s*invoke\s+name="|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);
+  const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜DSML｜｜\s*(?:invoke\s+name="|parameter\s+name="calls")|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);
   // Protocol markers inside a JSON string are data. Select the outer
   // representation before scanning the richer DSML forms.
   const jsonOuter = /^[{[]/.test(source) || (jsonAt >= 0 && (dsmlAt < 0 || jsonAt < dsmlAt));
   let decision: Decision;
   try { decision = jsonOuter ? jsonDecision(source, request, repairs)
-    : alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
+    : callsParameterDecision(source, request, repairs) ?? alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
       missingCallsOpener(source, request, repairs) ?? jsonDecision(source, request, repairs); }
   catch (error) {
     if (error instanceof z.ZodError) {

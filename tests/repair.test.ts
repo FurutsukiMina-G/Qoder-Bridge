@@ -30,6 +30,44 @@ const readRequest = ChatRequest.parse({ ...request, tools: [...request.tools!, {
     required: ['file_path'], additionalProperties: false },
 } }] });
 
+const unwrappedCallsParameter = (calls: unknown) => '<｜｜DSML｜｜ parameter name="calls" string="false">' +
+  JSON.stringify(calls) + '</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>';
+
+test('a complete calls parameter without opening wrappers preserves the entire batch and literal marker data', () => {
+  const pattern = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="unknown"> literal ' +
+    '{"kind":"final","content":"example"} <｜｜DS｜｜tool_calls｜｜DS｜｜';
+  const calls = [{ name: 'grep', arguments: { pattern } }, { name: 'grep', arguments: { pattern: '中文' } }];
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision('Use both searches.\n' + unwrappedCallsParameter(calls), request, repair => repairs.push(repair)),
+    { kind: 'tool_calls', calls });
+  assert.deepEqual(repairs, [{ kind: 'missing_calls_parameter_wrapper', tool: 'wrapper', parameter: 'calls' }]);
+  assert.deepEqual(parseDecision(unwrappedCallsParameter([calls[1]]), request), { kind: 'tool_call', ...calls[1] });
+});
+
+test('unwrapped calls parameters reject incomplete boundaries and validate every call before reporting repair', () => {
+  const source = unwrappedCallsParameter([{ name: 'grep', arguments: { pattern: 'first' } }, { name: 'grep', arguments: { pattern: 'second' } }]);
+  for (const invalid of [source + 'extra', source.replace(/<\/｜｜DSML｜｜ calls>$/, ''),
+    source.replace('}]</｜｜DSML', '}</｜｜DSML'), source.replace('string="false"', 'string="true"'),
+    source.replace('"pattern":"second"', '"unknown":"second"'), unwrappedCallsParameter([])]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(invalid, request, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+  assert.throws(() => parseDecision(source.replace('"name":"grep"', '"name":"unknown"'), request), /Unknown/);
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...request, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...request,
+    tool_choice: { type: 'function', function: { name: 'edit' } } })), /unselected/);
+});
+
+test('outer JSON keeps a literal unwrapped calls parameter as content', () => {
+  const content = unwrappedCallsParameter([{ name: 'grep', arguments: { pattern: 'example' } }]);
+  assert.deepEqual(parseDecision(JSON.stringify({ kind: 'final', content }), request), { kind: 'final', content });
+  const malformed = unwrappedCallsParameter([{ name: 'grep', arguments: {
+    pattern: '{"kind":"tool_call","name":"grep","arguments":{"pattern":"embedded"}}',
+  } }]).replace(/<\/｜｜DSML｜｜ calls>$/, '');
+  assert.throws(() => parseDecision(malformed, request));
+});
+
 test('a missing DSML outer opener preserves one complete write with an explicit outer close', () => {
   const content = '    Write-Output "quoted"\n$path = "D:\\fixture"\n';
   const body = '<｜｜DSML｜｜ invoke name="write">\n' +
