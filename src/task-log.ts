@@ -24,6 +24,8 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   credits_delta_source?: string; client_usage?: unknown; client_cache_usage?: string;
   reasoning_tokens?: number | null; output_tokens_per_second?: number | null;
   cache_estimate_tokens?: number | null; cache_estimate_ratio?: number | null; context_usage_ratio?: number | null;
+  decision_repairs?: unknown[]; stream_stop_reasons?: string[];
+  api_retries?: number; api_retry_details?: unknown[]; api_error_categories?: string[]; model_queue_statuses?: unknown[];
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -75,8 +77,12 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       client_usage: turn?.client_usage ?? null, client_cache_usage: turn?.client_cache_usage ?? 'omitted',
       reasoning_tokens: turn?.reasoning_tokens ?? null, output_tokens_per_second: turn?.output_tokens_per_second ?? null,
       context_usage_ratio: turn?.context_usage_ratio ?? null,
+      decision_repairs: turn?.decision_repairs ?? [], stream_stop_reasons: turn?.stream_stop_reasons ?? [],
+      api_retries: turn?.api_retries ?? null, api_retry_details: turn?.api_retry_details ?? [],
+      api_error_categories: turn?.api_error_categories ?? [], model_queue_statuses: turn?.model_queue_statuses ?? [],
       cache_status: turn?.cache_usage_status ?? 'unavailable', cache_hit_ratio: turn?.cache_hit_ratio ?? null,
       cache_estimate_tokens: turn?.cache_estimate_tokens ?? null, cache_estimate_ratio: turn?.cache_estimate_ratio ?? null,
       tool_definitions_reused: turn?.tool_definitions_reused ?? null },
+    context_transport: { history_mode: turn?.history_mode ?? null, sent_message_count: turn?.sent_message_count ?? null },
   };
 }

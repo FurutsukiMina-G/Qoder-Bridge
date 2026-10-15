@@ -59,6 +59,29 @@ test('deadline closes the owned SDK session and returns an auditable failed repo
     assert.equal(record.busy, 0);
   } finally { clearTimeout(keepAlive); }
 });
+test('human approval waits retain context past twenty minutes but still release expired idle sessions', async () => {
+  const { pool, record, counts } = fakePool();
+  try {
+    await pool.infer(request);
+    const internals = pool as unknown as { sweepIdle(): void };
+    record.touched = Date.now() - 30 * 60_000;
+    internals.sweepIdle();
+    assert.equal(counts().closed, 0);
+    await pool.infer({ ...request, messages: [...request.messages, { role: 'user', content: 'Approved; continue' }] });
+    assert.equal(counts().prompts, 2); assert.equal(pool.stats().sessions, 1);
+    record.touched = Date.now() - 61 * 60_000;
+    internals.sweepIdle(); assert.equal(counts().closed, 1);
+  } finally { pool.closeAll(); }
+});
+test('idle cleanup never closes a busy session and rejects invalid retention configuration', async () => {
+  const { pool, record, counts } = fakePool();
+  try {
+    await pool.infer(request); record.touched = Date.now() - 61 * 60_000; record.busy = 1;
+    (pool as unknown as { sweepIdle(): void }).sweepIdle();
+    assert.equal(counts().closed, 0); record.busy = 0;
+  } finally { pool.closeAll(); }
+  assert.throws(() => new QoderPool({ auth: 'cli', timeout: 5000, strategy: 'permission', system: 'test', sessionIdleMs: NaN }), /sessionIdleMs/);
+});
 test('SDK failure retains reported Credits instead of losing its whole telemetry record', async () => {
   const { pool, counts } = fakePool(5000, false, true);
   const result = await pool.infer(request);

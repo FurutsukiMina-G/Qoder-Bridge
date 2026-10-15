@@ -3,6 +3,9 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { SDKMessage, SDKAssistantMessage, SDKResultMessage } from '@qodercn-ai/qodercn-agent-sdk';
 import { aggregateUsage, measuredUsage, reportedUsage, tokenDeltasReliable, type StreamTokens } from './usage.js';
+const API_ERROR_CODES = new Set(['authentication_failed', 'billing_error', 'rate_limit', 'invalid_request',
+  'server_error', 'unknown', 'max_output_tokens']);
+const apiErrorCode = (value: unknown) => typeof value === 'string' && API_ERROR_CODES.has(value) ? value : 'unknown';
 
 export class Telemetry {
   readonly request_id = randomUUID();
@@ -22,8 +25,15 @@ export class Telemetry {
   private streamTokens = new Map<string, StreamTokens>();
   private streamKey = 'stream-0';
   private unstreamedText = false;
+  private streamStopReasons = new Set<string>();
   finished: number | null = null;
   apiRetries = 0;
+  private apiRetryDetails: Array<{ attempt: number; max_retries: number; retry_delay_ms: number;
+    error_status: number | null; error: string }> = [];
+  private apiErrorCategories: string[] = [];
+  private modelQueueStatuses: Array<{ status: 'queued' | 'ready'; queue_count: number | null;
+    wait_time_ms: number | null; queue_wait_elapsed_ms: number | null; queue_max_wait_ms: number | null;
+    service_available: boolean | null }> = [];
   session_id: string | null = null;
   cli_version: string | null = null;
   init: { tools: string[]; skills: string[]; plugins: unknown[] } | null = null;
@@ -43,10 +53,25 @@ export class Telemetry {
       this.cli_version = message.qodercli_version;
       this.init = { tools: message.tools, skills: message.skills, plugins: message.plugins };
     }
-    if (message.type === 'system' && message.subtype === 'api_retry') this.apiRetries++;
+    if (message.type === 'system' && message.subtype === 'api_retry') {
+      this.apiRetries++;
+      this.apiRetryDetails.push({ attempt: message.attempt, max_retries: message.max_retries,
+        retry_delay_ms: message.retry_delay_ms, error_status: message.error_status, error: apiErrorCode(message.error) });
+      if (this.apiRetryDetails.length > 16) this.apiRetryDetails.shift();
+    }
+    if (message.type === 'system' && message.subtype === 'model_queue_status') {
+      this.modelQueueStatuses.push({ status: message.status, queue_count: message.queue_count ?? null,
+        wait_time_ms: message.wait_time_ms ?? null, queue_wait_elapsed_ms: message.queue_wait_elapsed_ms ?? null,
+        queue_max_wait_ms: message.queue_max_wait_ms ?? null, service_available: message.service_available ?? null });
+      if (this.modelQueueStatuses.length > 16) this.modelQueueStatuses.shift();
+    }
+    if (message.type === 'assistant' && message.isApiErrorMessage) {
+      this.apiErrorCategories.push(apiErrorCode(message.error));
+      if (this.apiErrorCategories.length > 16) this.apiErrorCategories.shift();
+    }
     if (message.type === 'stream_event') {
       const event = message.event as unknown as { type: string; message?: { id?: string; usage?: Record<string, unknown> };
-        usage?: Record<string, unknown>; delta?: { type?: string; text?: string; thinking?: string } };
+        usage?: Record<string, unknown>; delta?: { type?: string; text?: string; thinking?: string; stop_reason?: unknown } };
       if (event.type === 'message_start') {
         this.streamKey = event.message?.id ?? `stream-${this.streamTokens.size}`;
         this.tokens();
@@ -57,6 +82,7 @@ export class Telemetry {
       const ratio = this.streamUsage.get(this.streamKey)?.context_usage_ratio;
       if (typeof ratio === 'number') this.tokens().contextRatio = ratio;
       const delta = event.delta;
+      if (event.type === 'message_delta' && typeof delta?.stop_reason === 'string') this.streamStopReasons.add(delta.stop_reason);
       if (message.event.type === 'content_block_delta') this.first_event_ms ??= performance.now() - this.started;
       if (delta?.type === 'text_delta' && delta.text) {
         this.ttft_ms ??= performance.now() - this.started;
@@ -106,6 +132,8 @@ export class Telemetry {
       output_tokens: m.message.usage?.output_tokens ?? null,
       credits: m.message.usage?.credits ?? null, original_credits: m.message.usage?.original_credits ?? null,
       billable: m.message.usage?.billable ?? null,
+      stop_reason: (m.message as unknown as { stop_reason?: unknown }).stop_reason ?? null,
+      content_types: m.message.content.map(part => part.type),
     }));
     const sum = (field: 'credits' | 'original_credits' | 'input_tokens' | 'output_tokens') =>
       rows.length && rows.every(r => typeof r[field] === 'number') ? rows.reduce((n, r) => n + r[field]!, 0) : null;
@@ -125,6 +153,8 @@ export class Telemetry {
       sdk_errors: this.result && 'errors' in this.result ? this.result.errors.map(safeError) : [],
       model_requests: rows.length || null, model_request_count_source: 'unique assistant request/message IDs',
       policy_calls: this.policyCalls, assistant_messages: rows.length, api_retries: this.apiRetries,
+      api_retry_details: [...this.apiRetryDetails], api_error_categories: [...this.apiErrorCategories],
+      model_queue_statuses: [...this.modelQueueStatuses],
       input_tokens: sum('input_tokens'), output_tokens: sum('output_tokens'), credits: assistantCredits ?? streamCredits,
       request_credits_source: assistantCredits !== null ? 'assistant' : streamCredits !== null ? 'stream_events' : 'unavailable',
       token_usage_status: resultUsage || streamUsage || assistantUsage ? 'reported'
@@ -149,6 +179,7 @@ export class Telemetry {
       original_credits: sum('original_credits'), total_session_credits: this.result?.total_credits ?? null,
       billable: rows.map(r => r.billable), requests: rows,
       result: this.result?.subtype ?? 'incomplete', terminal_reason: this.result?.terminal_reason ?? null,
+      stream_stop_reasons: [...this.streamStopReasons],
       init: this.init,
     };
   }

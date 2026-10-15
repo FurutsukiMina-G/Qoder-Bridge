@@ -1,6 +1,6 @@
 # DeepSeek Harness 接入与验收
 
-已在本机运行的官方 DeepSeek Harness Desktop `0.1.7-rc.2` 配置自定义模型源：
+已在本机运行的官方 DeepSeek Harness Desktop `0.2.0-rc.2` 配置自定义模型源；本次更新后的 Pro `read`、Flash `pwsh`、SSE 与用量验证见 [桌面升级验收](desktop-update-20260930.md)：
 
 | 项目 | 值 |
 |---|---|

@@ -180,8 +180,12 @@ export async function createBridgeServer(config: Config, options: {
       const message = safeError(cause);
       await writeTaskLog(undefined, message);
       process.stderr.write(`[bridge] ${message}\n`);
-      const error = { message: 'QoderBridge could not complete the model request', type: 'upstream_error',
-        code: controller.signal.aborted ? 'request_cancelled_or_timeout' : 'model_decision_error', request_id: bridgeRequestId };
+      const turnLimit = message.includes('Qoder result: error_max_turns');
+      const invalidArguments = /^Arguments for [\w.-]+ violate its schema/.test(message);
+      const error = { message: turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
+        : invalidArguments ? message.slice(0, 300) : 'QoderBridge could not complete the model request', type: 'upstream_error',
+        code: controller.signal.aborted ? 'request_cancelled_or_timeout' : turnLimit ? 'qoder_turn_limit'
+          : invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId };
       if (!res.headersSent) send(res, requestAccepted ? 502 : 400, { error });
       else if (!res.destroyed) { res.write(`data: ${JSON.stringify({ error })}\n\n`); res.end(); }
     } finally {

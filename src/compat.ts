@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import Ajv from 'ajv';
 import { z } from 'zod';
+import { diagnosticToolName } from './diagnostics.js';
 
 const Message = z.object({ role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
   content: z.unknown().optional(), tool_calls: z.array(z.unknown()).optional(),
@@ -24,6 +26,14 @@ const Decision = z.discriminatedUnion('kind', [
   }).strict()).min(1) }).strict(),
 ]);
 export type Decision = z.infer<typeof Decision>;
+export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_parameter' | 'encoded_arguments' | 'encoded_content_quotes' |
+  'parameter_annotation' | 'attributed_shorthand_parameter' | 'identical_parameter' | 'call_wrapper_close' |
+  'unwrapped_call' | 'redundant_tool_name' | 'flat_tool_kind' | 'alternate_ds' | 'repeated_dsml' |
+  'prefix_shorthand_parameter' | 'packed_content_quotes' | 'arguments_wrapper_close' |
+  'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
+  'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
+  'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
+  'attributed_call_envelope'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -42,7 +52,7 @@ function parseJson(text: string): unknown {
     throw original;
   }
 }
-function objectAt(text: string, start: number): unknown {
+function objectRange(text: string, start: number): { value: unknown; end: number } {
   if (start < 0 || text[start] !== '{') throw new Error('Decision JSON object is missing');
   let depth = 0; let quoted = false; let escaped = false; let end = -1;
   for (let i = start; i < text.length; i++) {
@@ -56,9 +66,10 @@ function objectAt(text: string, start: number): unknown {
     else if (char === '}' && --depth === 0) { end = i + 1; break; }
   }
   if (end < 0) throw new Error('Decision JSON object is incomplete');
-  return parseJson(text.slice(start, end));
+  return { value: parseJson(text.slice(start, end)), end };
 }
-function arrayAt(text: string, start: number): unknown {
+function objectAt(text: string, start: number): unknown { return objectRange(text, start).value; }
+function arrayRange(text: string, start: number): { value: unknown; end: number } {
   if (start < 0 || text[start] !== '[') throw new Error('Decision JSON array is missing');
   const stack: string[] = []; let quoted = false; let escaped = false;
   for (let i = start; i < text.length; i++) {
@@ -74,12 +85,104 @@ function arrayAt(text: string, start: number): unknown {
     else if (char === '{') stack.push('}');
     else if (char === ']' || char === '}') {
       if (stack.pop() !== char) throw new Error('Decision JSON array has mismatched delimiters');
-      if (!stack.length) return parseJson(text.slice(start, i + 1));
+      if (!stack.length) return { value: parseJson(text.slice(start, i + 1)), end: i + 1 };
     }
   }
   throw new Error('Decision JSON array is incomplete');
 }
-function callsArray(text: string): unknown {
+function arrayAt(text: string, start: number): unknown { return arrayRange(text, start).value; }
+function alternateDsDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
+  const start = /<｜｜(DS|DSML)｜｜\s*tool_calls\s*｜｜\1｜｜>?/.exec(text);
+  if (!start) return null;
+  const marker = start[1]!;
+  const repeated = new RegExp(`^<?｜｜${marker}｜｜\\s*(\\/?\\w+)(?:\\s+name="([^"]+)")?(?:\\s+string="(true|false)")?\\s*｜｜${marker}｜｜>?`);
+  const standardOpen = new RegExp(`^<｜｜${marker}｜｜\\s*(invoke|parameter)(?:\\s+name="([^"]+)")?(?:\\s+string="(true|false)")?\\s*>`);
+  const inverted = new RegExp(`^<｜｜/${marker}｜｜\\s*(invoke|tool_calls)\\s*｜｜${marker}｜｜>?`);
+  const canonical = new RegExp(`^</｜｜${marker}｜｜\\s*(parameter|invoke|tool_calls)\\s*>`);
+  const parameterClose = new RegExp(`<?｜｜${marker}｜｜\\s*/parameter\\s*｜｜${marker}｜｜>?|</｜｜${marker}｜｜\\s*parameter\\s*>`);
+  let cursor = start.index + start[0].length;
+  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+  const token = () => {
+    while (cursor < text.length && /\s/.test(text[cursor]!)) cursor++;
+    const remainder = text.slice(cursor);
+    const match = repeated.exec(remainder) ?? standardOpen.exec(remainder);
+    if (!match) {
+      const close = inverted.exec(remainder) ?? canonical.exec(remainder);
+      if (!close) throw new Error('Alternate DS tool block is incomplete or malformed');
+      cursor += close[0].length;
+      return { kind: `/${close[1]!}`, name: undefined, stringFlag: undefined };
+    }
+    cursor += match[0].length;
+    return { kind: match[1]!, name: match[2], stringFlag: match[3] };
+  };
+  while (true) {
+    const open = token();
+    if (open.kind === '/tool_calls') {
+      if (text.slice(cursor).trim()) throw new Error('Unexpected data after alternate DS calls');
+      return Decision.parse(calls.length === 1 ? { kind: 'tool_call', ...calls[0] } : { kind: 'tool_calls', calls });
+    }
+    if (open.kind !== 'invoke' || !open.name) throw new Error('Alternate DS call name is missing');
+    const name = open.name;
+    const provided = request.tools?.filter(tool => tool.function.name === name) ?? [];
+    if (provided.length !== 1) throw new Error(`Unknown or ambiguous alternate DS tool: ${name}`);
+    const schema = provided[0]!.function.parameters as { properties?: Record<string, { type?: unknown }> } | undefined;
+    const args: Record<string, unknown> = {};
+    while (true) {
+      const field = token();
+      if (field.kind === '/invoke') break;
+      if (field.kind !== 'parameter' || !field.name) throw new Error('Alternate DS parameter name is missing');
+      const type = schema?.properties?.[field.name]?.type;
+      const packed = field.name === 'arguments' && !Object.hasOwn(schema?.properties ?? {}, 'arguments');
+      if (!field.stringFlag && !packed && !['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'].includes(String(type)))
+        throw new Error(`Alternate DS parameter type is not declared: ${field.name}`);
+      const isString = field.stringFlag ? field.stringFlag === 'true' : type === 'string';
+      const valueStart = cursor;
+      let value: unknown;
+      if (!isString) {
+        let jsonStart = cursor;
+        while (jsonStart < text.length && /\s/.test(text[jsonStart]!)) jsonStart++;
+        if (text[jsonStart] === '{' || text[jsonStart] === '[') {
+          const range = text[jsonStart] === '{' ? objectRange(text, jsonStart) : arrayRange(text, jsonStart);
+          value = range.value; cursor = range.end;
+        } else {
+          const close = parameterClose.exec(text.slice(valueStart));
+          if (!close) throw new Error('Alternate DS parameter is incomplete');
+          cursor = valueStart + close.index;
+          value = parseJson(text.slice(valueStart, cursor).trim());
+        }
+      } else {
+        const close = parameterClose.exec(text.slice(valueStart));
+        if (close) {
+          cursor = valueStart + close.index;
+          value = text.slice(valueStart, cursor);
+        } else {
+          // Observed final workdir has a bare parameter marker immediately
+          // before the explicit invoke close. Recover only this path boundary.
+          const broken = marker === 'DSML' && field.name === 'workdir' && type === 'string'
+            ? /｜｜DSML｜｜parameter>(?=\s*<｜｜\/DSML｜｜invoke｜｜DSML｜｜>?)/.exec(text.slice(valueStart)) : null;
+          const path = broken ? text.slice(valueStart, valueStart + broken.index) : '';
+          if (!broken || !/^[A-Za-z]:\\[^<\r\n]*$/.test(path)) throw new Error('Alternate DS parameter is incomplete');
+          value = path;
+          cursor = valueStart + broken.index + broken[0].length;
+          repairs.push({ kind: 'misclosed_parameter', tool: name, parameter: field.name });
+          if (Object.hasOwn(args, field.name) && !isDeepStrictEqual(args[field.name], value))
+            throw new Error(`Duplicate DS parameter: ${field.name}`);
+          args[field.name] = value;
+          continue;
+        }
+      }
+      if (token().kind !== '/parameter') throw new Error('Alternate DS parameter closing tag is missing');
+      if (Object.hasOwn(args, field.name) && !isDeepStrictEqual(args[field.name], value))
+        throw new Error(`Duplicate DS parameter: ${field.name}`);
+      args[field.name] = value;
+    }
+    const keys = Object.keys(args);
+    const packed = keys.length === 1 && keys[0] === 'arguments' && !Object.hasOwn(schema?.properties ?? {}, 'arguments');
+    calls.push({ name, arguments: packed ? z.record(z.string(), z.unknown()).parse(args.arguments) : args });
+    repairs.push({ kind: marker === 'DSML' ? 'repeated_dsml' : 'alternate_ds', tool: name, parameter: 'call' });
+  }
+}
+function callsArray(text: string, repairs: DecisionRepair[]): unknown {
   try { return parseJson(text); }
   catch (original) {
     // Some SDK-formatted call arrays carry an extra closing brace after the
@@ -87,20 +190,205 @@ function callsArray(text: string): unknown {
     // or another tool call, and validate every recovered call below.
     const end = text.lastIndexOf(']');
     if (end >= 0 && /^[}\]\s]+$/.test(text.slice(end + 1))) {
-      const recovered = parseJson(text.slice(0, end + 1));
-      if (Array.isArray(recovered)) return recovered;
+      try {
+        const recovered = parseJson(text.slice(0, end + 1));
+        if (Array.isArray(recovered)) return recovered;
+      } catch { /* A complete array may still have a missing call wrapper. */ }
+    }
+    const restored = missingCallClosures(`{"kind":"tool_calls","calls":${text.trim()}}`);
+    if (restored) {
+      repairs.push(...restored.repairs);
+      return (restored.value as { calls: unknown[] }).calls;
     }
     throw original;
   }
 }
-function dsmlDecision(text: string): Decision | null {
+function repairParameterMarkers(fragment: string, tool: string, request: ChatRequest,
+  repairs: DecisionRepair[]): string {
+  // An explicit JSON arguments object may contain literal protocol text as data.
+  // Its parser already preserves strings; don't rewrite inside that representation.
+  if (/<｜｜DSML｜｜\s*parameter\s+name="arguments"(?:\s[^>]*>|\s*:)/.test(fragment)) return fragment;
+  if (tool === 'tool_call') {
+    const boundary = /(<｜｜DSML｜｜\s*parameter\s+name="name"\s+string="true"\s*>)([A-Za-z_][\w-]*)<\/｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false"\s*>\s*/.exec(fragment);
+    if (boundary && (request.tools ?? []).filter(entry => entry.function.name === boundary[2]).length === 1) {
+      // The name's close carries the next field's attributes. Require the full
+      // argument object and its own close before separating these two fields.
+      const start = boundary.index + boundary[0].length;
+      const args = objectRange(fragment, start);
+      if (!/^\s*<\/｜｜DSML｜｜\s*parameter\s*>/.test(fragment.slice(args.end)))
+        throw new Error('Generic DSML arguments closing boundary is missing');
+      fragment = fragment.slice(0, boundary.index) + boundary[1] + boundary[2] +
+        '</｜｜DSML｜｜ parameter><｜｜DSML｜｜ parameter name="arguments" string="false">' + fragment.slice(start);
+      repairs.push({ kind: 'generic_arguments_boundary', tool: boundary[2]!, parameter: 'arguments' });
+      return fragment;
+    }
+  }
+  const schema = request.tools?.find(entry => entry.function.name === tool)?.function.parameters as
+    { properties?: Record<string, { type?: unknown }> } | undefined;
+  const properties = schema?.properties ?? {};
+  // The recorded response translated only the parameter opener into Chinese.
+  // Restore it only immediately after a closed parameter, with a declared string
+  // and its complete canonical closing boundary. The value remains opaque.
+  fragment = fragment.replace(/(<\/｜｜DSML｜｜\s*parameter\s*>\s*)<｜参数 name="([A-Za-z_]\w*)">([\s\S]*?)(?=<\/｜｜DSML｜｜\s*parameter\s*>)/g,
+    (source, boundary: string, name: string, value: string) => {
+      if (properties[name]?.type !== 'string' || /｜｜DSML｜｜|<｜参数/.test(value))
+        throw new Error(`Ambiguous or undeclared localized DSML parameter: ${name}`);
+      repairs.push({ kind: 'localized_parameter', tool, parameter: name });
+      return `${boundary}<｜｜DSML｜｜ parameter name="${name}" string="true">${value}`;
+    });
+  fragment = fragment.replace(/<｜｜DSML｜｜\s+file_path="([^"\r\n]+)"\s+old_string="([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/g,
+    (source, path: string, old: string) => {
+      // Recorded edit header lost its closing quote/angle, but retained the
+      // explicit parameter close. A complete code block boundary is required.
+      if (tool !== 'edit' || properties.file_path?.type !== 'string' || properties.old_string?.type !== 'string' ||
+          properties.new_string?.type !== 'string' || /｜｜DSML｜｜/.test(old) || !/}\s*$/.test(old)) return source;
+      repairs.push({ kind: 'attribute_parameters', tool, parameter: 'file_path,old_string' });
+      return `<｜｜DSML｜｜ parameter name="file_path" string="true">${path}</｜｜DSML｜｜ parameter>` +
+        `<｜｜DSML｜｜ parameter name="old_string" string="true">${old}</｜｜DSML｜｜ parameter>`;
+    });
+  fragment = fragment.replace(/(<｜｜DSML｜｜\s*parameter\s+name="file_path"(?:\s+string="true")?\s*>)([^<｜]*?)(?<![<\/])｜｜DSML｜｜\s*parameter\s+name="old_string"(?:\s+string="true")?\s*>/g,
+    (source, open: string, path: string) => {
+      if (properties.file_path?.type !== 'string' || properties.old_string?.type !== 'string' ||
+        !path.trim() || /[\r\n]/.test(path.trim())) return source;
+      repairs.push({ kind: 'parameter_boundary', tool, parameter: 'old_string' });
+      return `${open}${path}</｜｜DSML｜｜ parameter><｜｜DSML｜｜ parameter name="old_string" string="true">`;
+    });
+  // Recorded shorthand puts the explicit field name before the DSML marker.
+  // Only a declared string with its complete closing boundary can be restored.
+  fragment = fragment.replace(/<｜\s+([A-Za-z_]\w*)｜｜DSML｜｜>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/g,
+    (source, name: string, value: string) => {
+      if (!Object.hasOwn(properties, name) || properties[name]?.type !== 'string' || /｜｜DSML｜｜/.test(value)) return source;
+      repairs.push({ kind: 'prefix_shorthand_parameter', tool, parameter: name });
+      return `<｜｜DSML｜｜ parameter name="${name}" string="true">${value}</｜｜DSML｜｜ parameter>`;
+    });
+  // Observed corruption closes one parameter with the attributes of the next.
+  // Preserve that boundary and open the explicitly named field; never invent a value.
+  fragment = fragment.replace(/<\/｜｜DSML｜｜\s*parameter\s+name="([A-Za-z_]\w*)"(?:\s+string="(true|false)")?\s*>/g,
+    (source, name: string, stringFlag: string) => {
+      if (!Object.hasOwn(properties, name) || (!stringFlag && properties[name]?.type !== 'string')) return source;
+      repairs.push({ kind: 'misclosed_parameter', tool, parameter: name });
+      return `</｜｜DSML｜｜ parameter><｜｜DSML｜｜ parameter name="${name}" string="${stringFlag ?? 'true'}">`;
+    });
+  // The other observed form is <DSML pattern"literal</DSML parameter>.
+  // Recover only a declared string field with a complete, unambiguous closing tag.
+  return fragment.replace(/<｜｜DSML｜｜\s+([A-Za-z_]\w*)"([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>/g,
+    (source, name: string, value: string) => {
+      if (!Object.hasOwn(properties, name) || properties[name]?.type !== 'string' ||
+        /<\/?｜｜DSML｜｜/.test(value)) return source;
+      // <DSML new_string" = ""/> is a self-closing annotation, not the
+      // observed missing-header form. Don't turn it into a second value.
+      if (/^\s*=\s*"[^"\r\n]*"\s*\/>/.test(value)) {
+        // The recorded placeholder also carries the literal filler "junk"
+        // after the self-closing tag. Neither is an actual parameter value.
+        if (!/^\s*=\s*""\s*\/>\s*(?:junk\s*)?$/.test(value)) throw new Error(`Ambiguous DSML parameter annotation: ${name}`);
+        const declared = [...fragment.matchAll(new RegExp(`<｜｜DSML｜｜\\s*parameter\\s+name="${name}"[^>]*>`, 'g'))];
+        if (declared.length === 1) repairs.push({ kind: 'parameter_annotation', tool, parameter: name });
+        return source;
+      }
+      const attributed = /^\s+string="true"\s*>([\s\S]*)$/.exec(value);
+      if (attributed) {
+        repairs.push({ kind: 'attributed_shorthand_parameter', tool, parameter: name });
+        return `<｜｜DSML｜｜ parameter name="${name}" string="true">${attributed[1]}</｜｜DSML｜｜ parameter>`;
+      }
+      repairs.push({ kind: 'shorthand_parameter', tool, parameter: name });
+      return `<｜｜DSML｜｜ parameter name="${name}" string="true">${value}</｜｜DSML｜｜ parameter>`;
+    });
+}
+function invocationEnd(fragment: string): number | null {
+  const tokens = /<｜｜DSML｜｜\s*parameter\s+name="([^"]+)"[^>]*>|<\/｜｜DSML｜｜\s*invoke\s*>/g;
+  let token: RegExpExecArray | null;
+  while ((token = tokens.exec(fragment))) {
+    if (token[1] === undefined) return tokens.lastIndex;
+    const valueStart = tokens.lastIndex;
+    if (token[1] === 'arguments') {
+      const start = fragment.indexOf('{', valueStart);
+      if (start >= 0) {
+        try { tokens.lastIndex = objectRange(fragment, start).end; continue; }
+        catch { /* Normal decision validation will reject incomplete arguments. */ }
+      }
+    }
+    // Invoke-like text in a scalar value is data, not a call boundary.
+    const closing = /<\/｜｜DSML｜｜\s*parameter(?:\s[^>]*)?>/.exec(fragment.slice(valueStart));
+    if (!closing) return null;
+    tokens.lastIndex = valueStart + closing.index + closing[0].length;
+    if (token[1] === 'name' && /^<\/｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false"\s*>$/.test(closing[0])) {
+      const start = fragment.indexOf('{', tokens.lastIndex);
+      if (start >= 0 && !fragment.slice(tokens.lastIndex, start).trim()) {
+        try { tokens.lastIndex = objectRange(fragment, start).end; }
+        catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+function unwrappedCalls(tail: string, repairs: DecisionRepair[], request: ChatRequest, owner = 'wrapper'): Array<{ name: string; arguments: unknown }> {
+  if (/^\s*<｜｜DSML｜｜\s*parameter\s+name="tool_calls">\s*(?:<\/｜｜DSML｜｜\s*(?:calls|tool_calls)>\s*)?$/.test(tail) &&
+      !(request.tools ?? []).some(tool => Object.hasOwn((tool.function.parameters as { properties?: object } | undefined)?.properties ?? {}, 'tool_calls'))) {
+    repairs.push({ kind: 'empty_call_annotation', tool: owner, parameter: 'tool_calls' });
+    return [];
+  }
+  if (!/<｜｜DSML｜｜\s*parameter\s+name="/.test(tail)) return [];
+  const calls: Array<{ name: string; arguments: unknown }> = [];
+  let cursor = 0;
+  while (cursor < tail.length) {
+    const remainder = tail.slice(cursor);
+    const spacing = /^(?:\s|<\/｜｜DSML｜｜\s*(?:invoke|parameter|calls|tool_calls)\s*>)+/.exec(remainder);
+    if (spacing) { cursor += spacing[0].length; continue; }
+    const named = /^<｜｜DSML｜｜\s*parameter\s+name="name"(?:\s+string="true")?\s*>([^<]+)<\/｜｜DSML｜｜\s*parameter\s*>/.exec(remainder);
+    if (!named) {
+      const end = invocationEnd(remainder);
+      if (end === null) throw new Error('Unwrapped DSML call must have a complete closing boundary');
+      const fragment = remainder.slice(0, end);
+      const fields = [...fragment.matchAll(/<\/?｜｜DSML｜｜\s*parameter\s+name="([^"]+)"/g)].map(field => field[1]!);
+      // A closed parameter-form call may lose its invoke opener. All explicit
+      // fields and every required field must identify exactly one supplied schema.
+      const candidates = (request.tools ?? []).filter(tool => {
+        const schema = tool.function.parameters as { properties?: Record<string, { type?: unknown }>; required?: unknown } | undefined;
+        return fields.length > 0 && schema?.properties && Array.isArray(schema.required) && schema.required.length > 0 &&
+          fields.every(field => schema.properties![field]?.type === 'string') && schema.required.every(field => typeof field === 'string' && fields.includes(field));
+      });
+      if (candidates.length !== 1) throw new Error('Unwrapped DSML parameter call has no unique supplied-tool schema');
+      const name = candidates[0]!.function.name;
+      const restored = dsmlDecision(`<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="${name}">${fragment}</｜｜DSML｜｜ calls>`, request, repairs);
+      if (restored?.kind !== 'tool_call') throw new Error('Unwrapped DSML parameter call is incomplete');
+      calls.push({ name: restored.name, arguments: restored.arguments });
+      repairs.push({ kind: 'schema_matched_call', tool: name, parameter: 'call' });
+      cursor += end;
+      continue;
+    }
+    const name = named[1]!.trim();
+    cursor += named[0].length;
+    const argumentTag = /^\s*<｜｜DSML｜｜\s*parameter\s+name="arguments"(?:\s+string="false")?\s*>\s*/.exec(tail.slice(cursor));
+    if (!argumentTag) throw new Error('Unwrapped DSML call arguments are missing');
+    cursor += argumentTag[0].length;
+    const args = objectRange(tail, cursor);
+    cursor = args.end;
+    const close = /^\s*<\/｜｜DSML｜｜\s*parameter\s*>/.exec(tail.slice(cursor));
+    if (!close) throw new Error('Unwrapped DSML arguments closing tag is missing');
+    cursor += close[0].length;
+    calls.push({ name, arguments: args.value });
+    repairs.push({ kind: 'unwrapped_call', tool: name, parameter: 'call' });
+  }
+  return calls;
+}
+function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
   const marker = /<｜｜DSML｜｜\s*(?:calls|tool_calls)>/.exec(text);
   const markerAt = marker?.index ?? -1;
   if (markerAt < 0) return null;
   text = text.slice(markerAt);
+  const attributed = /^<｜｜DSML｜｜\s*calls>\s*<｜｜DSML｜｜\s*invoke name="tool_call_call" name="([A-Za-z_][\w-]*)" arguments="(?=\{)/.exec(text);
+  if (attributed) {
+    if ((request.tools ?? []).some(tool => tool.function.name === 'tool_call_call'))
+      throw new Error('Attributed call wrapper conflicts with a supplied tool');
+    const args = objectRange(text, attributed[0].length);
+    if (!/^\s*<\/｜｜DSML｜｜\s*parameter>\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*calls>\s*$/.test(text.slice(args.end)))
+      throw new Error('Attributed call envelope has extra or incomplete closing data');
+    repairs.push({ kind: 'attributed_call_envelope', tool: attributed[1]!, parameter: 'call' });
+    return Decision.parse({ kind: 'tool_call', name: attributed[1], arguments: args.value });
+  }
   const wrappedCalls = /<｜｜DSML｜｜\s*parameter\s+name="calls"[^>]*>([\s\S]*?)(?:<\/｜｜DSML｜｜\s*parameter\s*>|$)/.exec(text);
   if (wrappedCalls) {
-    const raw = callsArray(wrappedCalls[1]!.trim()) as unknown;
+    const raw = callsArray(wrappedCalls[1]!.trim(), repairs) as unknown;
     if (!Array.isArray(raw) || !raw.length) throw new Error('DSML calls parameter is empty or invalid');
     const calls = raw.map(item => {
       if (!item || typeof item !== 'object') throw new Error('DSML tool call is invalid');
@@ -126,20 +414,34 @@ function dsmlDecision(text: string): Decision | null {
   }
   const calls = [...text.matchAll(/<｜｜DSML｜｜\s*invoke\s+name="([^"]+)">/g)];
   if (!calls.length) {
+    const tail = text.slice(marker![0].length);
+    if (/^\s*<｜｜DSML｜｜\s*parameter\s+name="name"/.test(tail)) {
+      const restored = unwrappedCalls(tail, repairs, request);
+      return Decision.parse(restored.length === 1 ? { kind: 'tool_call', ...restored[0] } : { kind: 'tool_calls', calls: restored });
+    }
     const bare = /<｜｜DSML｜｜\s*parameter\s+name="arguments"[^>]*>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter\s*>\s*<｜｜DSML｜｜\s*parameter\s+name="name"\s*:\s*"([^"]+)"\s*\}/.exec(text);
     if (bare) return Decision.parse({ kind: 'tool_call', name: bare[2],
       arguments: objectAt(bare[1]!, bare[1]!.indexOf('{')) });
     throw new Error('DSML contains no tool calls');
   }
-  const parsed = calls.map((call, index) => {
-  const fragment = text.slice(call.index, calls[index + 1]?.index ?? text.length);
+  const parsed: Array<{ name: string; arguments: unknown }> = [];
+  for (const [index, call] of calls.entries()) {
+  const span = text.slice(call.index, calls[index + 1]?.index ?? text.length);
+  const end = invocationEnd(span);
+  const fragment = repairParameterMarkers(end === null ? span : span.slice(0, end),
+    call[1]!, request, repairs);
   const fields = [...fragment.matchAll(/<｜｜DSML｜｜\s*parameter\s+name="([^"]+)"([^>]*)>([\s\S]*?)(?=<\/｜｜DSML｜｜(?:\s+parameter)?\s*>|<｜｜DSML｜｜\s*parameter|$)/g)];
   let name = call[1]!;
   const args: Record<string, unknown> = {};
   const argumentsField = fields.find(field => field[1] === 'arguments');
   if (argumentsField) {
     const start = fragment.indexOf('{', argumentsField.index);
-    Object.assign(args, objectAt(fragment, start));
+    try { Object.assign(args, objectAt(fragment, start)); }
+    catch (original) {
+      const suffix = fragment.slice(argumentsField.index! + argumentsField[0].length);
+      if (!/^<\/｜｜DSML｜｜\s*parameter\s*>/.test(suffix)) throw original;
+      Object.assign(args, encodedArguments(argumentsField[3]!.trim(), name, request, repairs, 'packed_content_quotes'));
+    }
   } else {
     const malformedArguments = /<｜｜DSML｜｜\s*parameter\s+name="arguments"\s*:/.exec(fragment);
     if (malformedArguments) Object.assign(args, objectAt(fragment, fragment.indexOf('{', malformedArguments.index)));
@@ -147,12 +449,27 @@ function dsmlDecision(text: string): Decision | null {
       const fieldName = field[1]!;
       const raw = field[3] ?? '';
       if (name === 'tool_call' && fieldName === 'name') { name = raw.trim(); continue; }
-      const isString = /\bstring="true"/.test(field[2] ?? '');
-      if (isString) args[fieldName] = raw;
-      else {
-        try { args[fieldName] = parseJson(raw.trim()); }
-        catch { args[fieldName] = raw.trim(); }
+      const schema = request.tools?.find(tool => tool.function.name === name)?.function.parameters as
+        { properties?: Record<string, unknown> } | undefined;
+      if (fieldName === 'name' && raw.trim() === name && schema?.properties && !Object.hasOwn(schema.properties, 'name')) {
+        repairs.push({ kind: 'redundant_tool_name', tool: name, parameter: 'name' });
+        continue;
       }
+      const stringFlag = /\bstring="(true|false)"/.exec(field[2] ?? '')?.[1];
+      const property = schema?.properties?.[fieldName] as { type?: unknown } | undefined;
+      const isString = stringFlag === 'true' || (!stringFlag && property?.type === 'string');
+      let value: unknown;
+      if (isString) value = raw;
+      else {
+        try { value = parseJson(raw.trim()); }
+        catch { value = raw.trim(); }
+      }
+      if (Object.hasOwn(args, fieldName)) {
+        if (!isDeepStrictEqual(args[fieldName], value)) throw new Error(`Duplicate DSML parameter: ${fieldName}`);
+        repairs.push({ kind: 'identical_parameter', tool: name, parameter: fieldName });
+        continue;
+      }
+      args[fieldName] = value;
     }
   }
   if (name === 'tool_call') {
@@ -160,49 +477,224 @@ function dsmlDecision(text: string): Decision | null {
     if (!toolName) throw new Error('DSML generic tool_call name is missing');
     name = toolName;
   }
-  return { name, arguments: args };
-  });
+  parsed.push({ name, arguments: args });
+  if (end !== null) parsed.push(...unwrappedCalls(span.slice(end), repairs, request, call[1]!));
+  }
   return Decision.parse(parsed.length === 1 ? { kind: 'tool_call', ...parsed[0] } :
     { kind: 'tool_calls', calls: parsed });
 }
-function jsonDecision(text: string): Decision {
+function encodedArguments(source: string, tool: string, request: ChatRequest, repairs: DecisionRepair[],
+  repairKind: 'encoded_content_quotes' | 'packed_content_quotes' = 'encoded_content_quotes'): unknown {
+  try { return parseJson(source); }
+  catch (original) {
+    const schema = request.tools?.find(entry => entry.function.name === tool)?.function.parameters as
+      { properties?: Record<string, { type?: unknown }> } | undefined;
+    if (tool !== 'write' || schema?.properties?.file_path?.type !== 'string' || schema.properties.content?.type !== 'string') throw original;
+    // Observed inner JSON has exactly file_path then a final content string.
+    // Its code quotes are underescaped, while the JSON escapes are intact.
+    const match = /^(\s*\{\s*"file_path"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"content"\s*:\s*")([\s\S]*)("\s*\}\s*)(\}\s*)?$/.exec(source);
+    if (!match || (match[4] && repairKind !== 'packed_content_quotes')) throw original;
+    const body = match[2]!;
+    // A possible following object field makes the final-string boundary ambiguous.
+    if (/"\s*,\s*"(?:[^"\\]|\\.)*"\s*:/.test(body)) throw original;
+    let escaped = false; let corrected = ''; let changes = 0;
+    for (const char of body) {
+      if (escaped) { escaped = false; corrected += char; }
+      else if (char === '\\') { escaped = true; corrected += char; }
+      else if (char === '"') { corrected += '\\"'; changes++; }
+      else corrected += char;
+    }
+    if (!changes || escaped) throw original;
+    const decoded = parseJson(`${match[1]}${corrected}${match[3]}`);
+    repairs.push({ kind: repairKind, tool, parameter: 'content' });
+    if (match[4]) repairs.push({ kind: 'arguments_wrapper_close', tool, parameter: 'arguments' });
+    return decoded;
+  }
+}
+function decisionObject(value: unknown, request: ChatRequest, repairs: DecisionRepair[]): Decision {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return Decision.parse(value);
+  let row = value as Record<string, unknown>;
+  const recovered: DecisionRepair[] = [];
+  if (!Object.hasOwn(row, 'kind') && Object.keys(row).length === 1 && Array.isArray(row.tool_calls) && row.tool_calls.length) {
+    row = { kind: 'tool_calls', calls: row.tool_calls };
+    recovered.push({ kind: 'tool_calls_envelope', tool: 'wrapper', parameter: 'tool_calls' });
+  }
+  if (typeof row.kind === 'string' && !['final', 'tool_call', 'tool_calls'].includes(row.kind)) {
+    const provided = request.tools?.filter(tool => tool.function.name === row.kind) ?? [];
+    const schema = provided.length === 1 ? provided[0]!.function.parameters as
+      { properties?: Record<string, unknown> } | undefined : undefined;
+    const keys = Object.keys(row).filter(key => key !== 'kind');
+    // This observed form explicitly uses a provided tool as the discriminator.
+    // Move only declared fields; don't infer a tool from arbitrary JSON data.
+    if (schema?.properties && !Object.hasOwn(schema.properties, 'kind') &&
+      keys.every(key => Object.hasOwn(schema.properties!, key))) {
+      const name = row.kind;
+      row = { kind: 'tool_call', name, arguments: Object.fromEntries(keys.map(key => [key, row[key]])) };
+      recovered.push({ kind: 'flat_tool_kind', tool: name, parameter: 'kind' });
+    }
+  }
+  const normalizeCall = (call: unknown, root = false): unknown => {
+    if (!call || typeof call !== 'object' || Array.isArray(call)) return call;
+    const item = call as Record<string, unknown>;
+    if (!Object.hasOwn(item, 'arguments') && typeof item.name === 'string') {
+      const provided = request.tools?.filter(tool => tool.function.name === item.name) ?? [];
+      const schema = provided.length === 1 ? provided[0]!.function.parameters as
+        { properties?: Record<string, unknown> } | undefined : undefined;
+      const keys = Object.keys(item).filter(key => key !== 'name' && (!root || key !== 'kind'));
+      if (schema?.properties && !Object.hasOwn(schema.properties, 'name') &&
+          (!root || !Object.hasOwn(schema.properties, 'kind')) && keys.every(key => Object.hasOwn(schema.properties!, key))) {
+        recovered.push({ kind: 'flat_call_arguments', tool: item.name, parameter: 'arguments' });
+        return { ...(root ? { kind: item.kind } : {}), name: item.name,
+          arguments: Object.fromEntries(keys.map(key => [key, item[key]])) };
+      }
+    }
+    if (typeof item.arguments !== 'string') return item;
+    const args = encodedArguments(item.arguments, typeof item.name === 'string' ? item.name : 'unknown', request, recovered);
+    if (!args || typeof args !== 'object' || Array.isArray(args))
+      throw new Error('Encoded tool arguments must decode to a JSON object');
+    recovered.push({ kind: 'encoded_arguments', tool: typeof item.name === 'string' ? item.name : 'unknown', parameter: 'arguments' });
+    return { ...item, arguments: args };
+  };
+  const normalized = row.kind === 'tool_call' ? normalizeCall(row, true)
+    : row.kind === 'tool_calls' && Array.isArray(row.calls) ? { ...row, calls: row.calls.map(call => normalizeCall(call)) } : row;
+  const decision = Decision.parse(normalized);
+  repairs.push(...recovered);
+  return decision;
+}
+function missingCallClosures(text: string): { value: unknown; repairs: DecisionRepair[] } | null {
+  const header = /^\s*\{\s*"kind"\s*:\s*"tool_calls"\s*,\s*"calls"\s*:\s*\[/.exec(text);
+  if (!header) return null;
+  try {
+    let cursor = header[0].length;
+    const calls: Array<{ name: string; arguments: unknown }> = [];
+    const repairs: DecisionRepair[] = [];
+    const space = () => { while (cursor < text.length && /\s/.test(text[cursor]!)) cursor++; };
+    while (true) {
+      space();
+      const call = /^\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"arguments"\s*:\s*/.exec(text.slice(cursor));
+      if (!call) return null;
+      const name = parseJson(call[1]!) as string;
+      cursor += call[0].length;
+      // Only an entire valid object is recoverable; never close incomplete
+      // arguments or drop a later call to make the batch look complete.
+      const args = objectRange(text, cursor);
+      calls.push({ name, arguments: args.value });
+      cursor = args.end;
+      space();
+      let closedCall = false;
+      if (text[cursor] === '}') { closedCall = true; cursor++; space(); }
+      else if (text[cursor] === ',' || text[cursor] === ']')
+        repairs.push({ kind: 'call_wrapper_close', tool: name, parameter: 'call' });
+      else return null;
+      if (text[cursor] === ',') { cursor++; continue; }
+      // Only complete call objects at EOF, or an explicit completed calls
+      // array, can lack the final decision wrapper. Never finish arguments.
+      if ((cursor === text.length && closedCall) || /^\]\s*$/.test(text.slice(cursor))) {
+        repairs.push({ kind: 'decision_wrapper_close', tool: name, parameter: 'calls' });
+        return { value: { kind: 'tool_calls', calls }, repairs };
+      }
+      if (!/^\]\s*\}\s*$/.test(text.slice(cursor)) || !repairs.length) return null;
+      return { value: { kind: 'tool_calls', calls }, repairs };
+    }
+  } catch { return null; }
+}
+function jsonDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision {
+  const custom = /^<custom_tool_call>\s*([\s\S]*?)\s*<\/custom_tool_call>$/.exec(text);
+  if (custom) {
+    const inner = parseJson(custom[1]!) as Record<string, unknown>;
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner) ||
+        Object.keys(inner).length !== 2 || !Object.hasOwn(inner, 'name') || !Object.hasOwn(inner, 'arguments'))
+      throw new Error('Custom tool envelope must have only explicit name and complete arguments');
+    const decision = decisionObject({ kind: 'tool_call', name: inner.name, arguments: inner.arguments }, request, repairs);
+    repairs.push({ kind: 'custom_tool_envelope', tool: String(inner.name), parameter: 'call' });
+    return decision;
+  }
   let decoded: unknown;
   try { decoded = parseJson(text); }
   catch (original) {
+    const stub = /,"}}\s*$/.exec(text);
+    if (stub) {
+      let quoted = false, escaped = false;
+      for (const char of text.slice(0, stub.index)) {
+        if (escaped) escaped = false;
+        else if (char === '\\' && quoted) escaped = true;
+        else if (char === '"') quoted = !quoted;
+      }
+      if (!quoted && !escaped) {
+        const restored = parseJson(text.slice(0, stub.index) + '}}') as Record<string, unknown>;
+        const args = restored?.arguments as Record<string, unknown> | undefined;
+        const provided = request.tools?.filter(tool => tool.function.name === 'edit') ?? [];
+        const schema = provided.length === 1 ? provided[0]!.function.parameters as
+          { properties?: Record<string, { type?: unknown }> } : undefined;
+        const names = ['file_path', 'old_string', 'new_string'];
+        if (restored.kind === 'tool_call' && restored.name === 'edit' && args && Object.keys(args).length === 3 &&
+            names.every(name => typeof args[name] === 'string' && schema?.properties?.[name]?.type === 'string')) {
+          const decision = decisionObject(restored, request, repairs);
+          repairs.push({ kind: 'terminal_field_stub', tool: 'edit', parameter: 'arguments' });
+          return decision;
+        }
+      }
+    }
+    const decorated = /^<\{\*\*tool_calls\*\*:\s*/.exec(text);
+    if (decorated) {
+      const complete = arrayRange(text, decorated[0].length);
+      if (!/^(?:\s|<?<\/?｜｜DSML｜｜\s*parameter\s*>)*$/.test(text.slice(complete.end))) throw original;
+      const decision = decisionObject({ kind: 'tool_calls', calls: complete.value }, request, repairs);
+      repairs.push({ kind: 'decorated_calls_envelope', tool: 'wrapper', parameter: 'tool_calls' });
+      return decision;
+    }
+    const restored = missingCallClosures(text);
+    if (restored) {
+      const decision = decisionObject(restored.value, request, repairs);
+      repairs.push(...restored.repairs);
+      return decision;
+    }
     let candidate: Decision | null = null;
+    let candidateRepairs: DecisionRepair[] = [];
     const starts = [...text.matchAll(/\{\s*"kind"\s*:\s*"(?:tool_calls|tool_call|final)"/g)];
     for (const start of starts) {
-      try { candidate = Decision.parse(objectAt(text, start.index)); }
+      try {
+        const recovered: DecisionRepair[] = [];
+        candidate = decisionObject(objectAt(text, start.index), request, recovered);
+        candidateRepairs = recovered;
+      }
       catch { /* Continue to a later complete decision block. */ }
     }
-    if (candidate) return candidate;
+    if (candidate) { repairs.push(...candidateRepairs); return candidate; }
     // Qoder occasionally writes the array/object as the value of "kind". Recover
     // these two exact wrappers, then run the usual tool-name and schema checks.
     const callsWrapper = /^\{\s*"kind"\s*:\s*"tool_calls"\s*:\s*\[/.exec(text);
     if (callsWrapper) {
       const corrected = text.replace(callsWrapper[0], '{"kind":"tool_calls","calls":[');
-      return Decision.parse(parseJson(corrected));
+      return decisionObject(parseJson(corrected), request, repairs);
     }
     const callWrapper = /^\{\s*"kind"\s*:\s*"tool_call"\s*:\s*\{/.exec(text);
     if (callWrapper) {
       const inner = objectAt(text, text.indexOf('{', callWrapper[0].length - 1));
-      return Decision.parse({ kind: 'tool_call', ...(inner as object) });
+      return decisionObject({ kind: 'tool_call', ...(inner as object) }, request, repairs);
     }
     // A plain assistant reply is a valid final answer. Never reinterpret a malformed
     // structured tool decision as prose, since that could hide an intended tool call.
     if (text && !text.startsWith('{') && !text.startsWith('[') &&
-      !text.includes('<｜｜DSML｜｜') && !/"kind"\s*:/.test(text))
+      !/｜｜(?:DSML|DS)｜｜/.test(text) && !/<\/?custom_tool_call\b/.test(text) && !/"kind"\s*:/.test(text))
       return { kind: 'final', content: text };
     throw original;
   }
-  return Decision.parse(decoded);
+  return decisionObject(decoded, request, repairs);
 }
-export function parseDecision(text: string, request: ChatRequest): Decision {
+export function parseDecision(text: string, request: ChatRequest, onRepair?: (repair: DecisionRepair) => void): Decision {
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(trimmed);
   const source = fenced?.[1] ?? trimmed;
+  const repairs: DecisionRepair[] = [];
+  const jsonAt = source.search(/\{\s*"kind"\s*:\s*"(?:tool_calls|tool_call|final)"/);
+  const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);
+  // Protocol markers inside a JSON string are data. Select the outer
+  // representation before scanning the richer DSML forms.
+  const jsonOuter = /^[{[]/.test(source) || (jsonAt >= 0 && (dsmlAt < 0 || jsonAt < dsmlAt));
   let decision: Decision;
-  try { decision = dsmlDecision(source) ?? jsonDecision(source); }
+  try { decision = jsonOuter ? jsonDecision(source, request, repairs)
+    : alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ?? jsonDecision(source, request, repairs); }
   catch (error) {
     if (error instanceof z.ZodError) {
       const detail = error.issues.slice(0, 3).map(issue =>
@@ -222,7 +714,7 @@ export function parseDecision(text: string, request: ChatRequest): Decision {
   const calls = decision.kind === 'tool_call' ? [decision] : decision.calls;
   for (const call of calls) {
     if (!names.includes(call.name) || (typeof selected === 'string' && selected !== call.name))
-      throw new Error(`Unknown or unselected tool name: ${call.name}`);
+      throw new Error(`Unknown or unselected tool name: ${diagnosticToolName(call.name)}`);
     const schema = request.tools?.find(t => t.function.name === call.name)?.function.parameters;
     if (schema && typeof schema === 'object') {
       const validate = json.compile(schema);
@@ -233,6 +725,7 @@ export function parseDecision(text: string, request: ChatRequest): Decision {
       }
     }
   }
+  for (const repair of repairs) onRepair?.(repair);
   return decision;
 }
 function contentText(content: unknown): string {

@@ -1,5 +1,7 @@
 # 2026-09-27 更新与优化核查
 
+2026-09-30 已进一步升级到官方桌面端 `0.2.0-rc.2`，旧程序目录和旧安装器已清理，工作数据及数据备份保留。最新验证见 [桌面升级验收](desktop-update-20260930.md)；本页记录首次升级与流式实现的历史。
+
 已将旧桌面壳 0.3.20（内置 Harness 0.1.5-rc.1）更新为 DeepSeek 官方 Windows `0.1.7-rc.2`。安装包来自官方 production 更新源，大小 288245480 字节，SHA-512 与 feed 一致，Authenticode 签名为 Hangzhou DeepSeek Artificial Intelligence Co., Ltd.。旧安装登记不被新安装器识别，因此保留旧目录并在原路径安装；没有修改安装器或绕过校验。
 
 回退材料保存在 `D:\DSH\DeepSeek Harness-legacy-0.3.20` 与项目 `.runtime/update-backup-20260926`。后者含用户配置/凭据备份，不应公开。新版使用 `~/.dsh/profiles/desktop` 和本机 19387 端口；原会话、QoderBridge 凭据引用、默认模型和 1M 配置已保留。RPC 脚本已支持新旧启动日志和经 Host 正常签发的本地 Cookie，认证信息只保存在忽略的 `.runtime` 中。

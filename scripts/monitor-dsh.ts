@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { rpc } from './dsh-rpc.js';
+import { diagnosticSummary } from '../src/diagnostics.js';
+import { monitorSignals, pendingApproval, type MonitorState } from '../src/monitor-state.js';
 
 type TaskEvent = {
   time: string; harness_session_key_hash: string | null; status: string; error: string | null;
@@ -18,6 +20,10 @@ const events: TaskEvent[] = (await readFile('reports/tasks.ndjson', 'utf8')).tri
   .map(line => JSON.parse(line) as TaskEvent);
 const args = process.argv.slice(2);
 const requestedSession = args.includes('--session') ? args[args.indexOf('--session') + 1] : undefined;
+const statePath = requestedSession ? `.runtime/monitor-state-${createHash('sha256').update(requestedSession).digest('hex').slice(0, 12)}.json` : null;
+let previous: MonitorState | null = null;
+if (statePath) try { previous = JSON.parse(await readFile(statePath, 'utf8')) as MonitorState; }
+catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const family = new Set<string>(requestedSession ? [requestedSession] : []);
 if (requestedSession) {
   let expanded = true;
@@ -53,62 +59,58 @@ const records: Array<{ sessionId: string; eventSeq: number | null; running: bool
     lastPromptAt: values.sessionListMetadata?.lastPromptAt ?? null,
     modelRequests: turns.filter(turn => !turn.telemetry?.local_response_replay).length,
     localReplays: turns.filter(turn => turn.telemetry?.local_response_replay).length,
-    credits: credits.every(x => typeof x === 'number') ? credits.reduce((sum, x) => sum + (x ?? 0), 0) : null,
+    credits: credits.every(x => typeof x === 'number' && Number.isFinite(x)) ? credits.reduce<number>((sum, x) => sum + (x ?? 0), 0) : null,
+    knownCredits: credits.reduce<number>((sum, x) => sum + (typeof x === 'number' && Number.isFinite(x) ? x : 0), 0),
     lastModelAt: last?.time ?? null, lastModelStatus: last?.status ?? null,
     lastToolDecision: last?.output?.kind === 'tool_call' ? last.output.name ?? null :
       last?.output?.kind === 'tool_calls' ? last.output.calls?.map(call => call.name).join(', ') ?? null : null,
     errorCount: errors.length, lastErrorAt: errors.at(-1)?.time ?? null,
-    lastModelError: errors.at(-1)?.error ?? null,
+    lastModelError: diagnosticSummary(errors.at(-1)?.error),
+    pendingApprovalSeq: previous?.sessions.find(row => row.sessionId === item.sessionId && row.eventSeq === item.projections?.asOfSeq)?.pendingApprovalSeq ?? null,
     planActive: values.plan?.active ?? false,
     todoCount: Array.isArray(values.todos) ? values.todos.length : null,
   };
 });
+// Query only idle, running sessions whose pending approval is not already known.
+// Normal model progress does not require fetching message history.
+if (service?.activeRequests === 0 && service?.queuedRequests === 0) {
+  const checks = await Promise.allSettled(records.filter(row => row.running && !row.pendingApprovalSeq).map(async row => {
+    const item = relevant.find((entry: any) => entry.sessionId === row.sessionId);
+    const address = item.parentSessionId ? { kind: 'subagent', parentSessionId: item.parentSessionId,
+      childSessionId: item.sessionId, mode: item.projections.values.subagent.mode }
+      : { kind: 'session', sessionId: item.sessionId };
+    const page = await rpc('session/page', { request: { address, throughSeq: row.eventSeq, maxMessages: 20 } });
+    row.pendingApprovalSeq = pendingApproval(page.records.map((record: any) => record.event ?? record));
+  }));
+  // Failure to inspect approvals must not imply that a task is blocked on one.
+  if (checks.some(result => result.status === 'rejected')) process.stderr.write('Approval status unavailable for some sessions\n');
+}
 const checkedAt = new Date().toISOString();
 const bridgeHealthy = service?.status === 'ok';
 let changes: string[] = [];
 let alerts: string[] = [];
 let complete = false;
-if (requestedSession) {
-  const targetHash = createHash('sha256').update(requestedSession).digest('hex').slice(0, 12);
-  const statePath = `.runtime/monitor-state-${targetHash}.json`;
-  type PreviousState = { bridgeHealthy: boolean; bridgePort?: number; lastProgressAt: string;
-    sessions: Array<{ sessionId: string; eventSeq: number | null; running: boolean; errorCount: number }> };
-  let previous: PreviousState | null = null;
-  try { previous = JSON.parse(await readFile(statePath, 'utf8')) as PreviousState; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  const root = records.find(row => row.sessionId === requestedSession);
-  complete = Boolean(root && records.length && records.every(row => !row.running));
-  let progress = false;
-  if (previous) {
-    for (const row of records) {
-      const old = previous.sessions.find(item => item.sessionId === row.sessionId);
-      if (!old) {
-        changes.push(`Subagent/session started: ${row.sessionId}`);
-        if (row.errorCount >= 3) alerts.push(`New subagent already has ${row.errorCount} model errors: ${row.sessionId}`);
-        progress = true;
-        continue;
-      }
-      if (row.eventSeq !== old.eventSeq) progress = true;
-      if (old.running && !row.running) changes.push(`Session finished: ${row.sessionId}`);
-      if (row.errorCount > old.errorCount) {
-        const count = row.errorCount - old.errorCount;
-        changes.push(`${count} new model error(s) in ${row.sessionId}`);
-        if (count >= 3) alerts.push(`Repeated new model errors in ${row.sessionId}: ${count}`);
-      }
-    }
-    if (previous.bridgeHealthy && !bridgeHealthy) alerts.push('QoderBridge became unavailable');
-    if (previous.bridgePort && previous.bridgePort !== bridgePort)
-      changes.push(`Harness provider switched from port ${previous.bridgePort} to ${bridgePort}`);
-    if (complete) alerts.push('Root task and tracked child sessions finished');
-    if (!progress && records.some(row => row.running) &&
-      Date.now() - Date.parse(previous.lastProgressAt) >= 15 * 60_000)
-      alerts.push('No new DSH event sequence for at least 15 minutes');
-  }
-  await writeFile(statePath, JSON.stringify({ bridgeHealthy, bridgePort, lastProgressAt: progress || !previous
-    ? checkedAt : previous.lastProgressAt,
-    sessions: records.map(row => ({ sessionId: row.sessionId, eventSeq: row.eventSeq,
-      running: row.running, errorCount: row.errorCount })) }, null, 2));
+let outcome = 'untracked';
+if (requestedSession && statePath) {
+  const signals = monitorSignals(records, previous, { rootId: requestedSession, now: Date.parse(checkedAt),
+    bridgeHealthy, bridgePort, activeRequests: service?.activeRequests ?? null });
+  ({ changes, alerts, outcome } = signals);
+  // Compatibility alias: all stopped is not evidence of successful business delivery.
+  complete = signals.allStopped;
+  await writeFile(statePath, JSON.stringify({ bridgeHealthy, bridgePort, lastProgressAt: signals.lastProgressAt,
+    sessions: records.map(row => ({ sessionId: row.sessionId, parentSessionId: row.parentSessionId, eventSeq: row.eventSeq,
+      running: row.running, errorCount: row.errorCount, lastModelStatus: row.lastModelStatus,
+      pendingApprovalSeq: row.pendingApprovalSeq })) }, null, 2));
 }
-console.log(JSON.stringify({ checkedAt, bridgeHealthy, bridgePort, bridgeURL: baseURL ?? null,
+const output = { checkedAt, bridgeHealthy, bridgePort, bridgeURL: baseURL ?? null,
+  bridgeActivity: { active: service?.activeRequests ?? null, queued: service?.queuedRequests ?? null },
   targetSession: requestedSession ?? null, activeCount: records.filter(row => row.running).length,
-  complete, changes, alerts, sessions: records }, null, 2));
+  complete, allStopped: complete, outcome, changes, alerts };
+console.log(JSON.stringify({ ...output, ...(args.includes('--brief') ? {
+  knownCredits: records.reduce((sum, row) => sum + Number(row.knownCredits), 0),
+  unknownCreditSessions: records.filter(row => row.credits === null).length,
+  sessions: records.filter(row => row.running || row.sessionId === requestedSession).map(row => ({
+    sessionId: row.sessionId, eventSeq: row.eventSeq, running: row.running, modelRequests: row.modelRequests,
+    errorCount: row.errorCount, pendingApprovalSeq: row.pendingApprovalSeq,
+  })),
+} : { sessions: records }) }, null, 2));

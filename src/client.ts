@@ -14,6 +14,8 @@ export interface Config extends Selection {
   sessionSettings?: string;
   /** Qoder reports no cache counts; 'estimate' sends the session-prefix estimate as cached_tokens. */
   cacheUsage?: 'none' | 'estimate';
+  /** Retain idle conversation context through human approval waits; bounded by pool capacity. */
+  sessionIdleMs?: number;
 }
 export function baseOptions(config: Config, controller: AbortController): Options {
   return {

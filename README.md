@@ -8,7 +8,9 @@
 
 不用启动 Qoder CN 桌面端也可尝试查询账户余额：运行 `npm.cmd run balance`，它通过官方 SDK 的 `getUsageInfo()` 读取额度，不发模型请求。当前这台机器的 SDK 返回 `null`，余额因此未知；可运行 `npm.cmd run qoder:tui`，在官方 CLI 中输入 `/usage`，或登录 Qoder CN 官网查看 Settings > Usage。Bridge 本身也不依赖桌面端常驻。
 
-Harness 已更新到官方 `0.1.7-rc.2`，Bridge 使用 `8646`。已实现 SDK 思考片段与规范 `final.content` 回答的即时 SSE 转发；工具参数仍在完整 Schema 校验后交付，非规范纯文字回答会在整轮结束后发送。完整核查与限制见 [更新、流式与用量](docs/update-and-streaming.md)。
+Harness 已更新到官方桌面端 `0.2.0-rc.2`，Bridge 使用 `8646`。新版内置 pi-ai `0.87.1` 的 SSE、工具参数和用量兼容检查通过，实际 Pro `read` 与 Flash `pwsh` 均完成工具→结果→最终回复循环，原有会话和凭据保留。见 [2026-09-30 桌面升级验收](docs/desktop-update-20260930.md)。已实现 SDK 思考片段与规范 `final.content` 回答的即时 SSE 转发；工具参数仍在完整 Schema 校验后交付，非规范纯文字回答会在整轮结束后发送。流式与用量口径见 [更新、流式与用量](docs/update-and-streaming.md)。
+
+2026-10-01 已修复实际出现的 DSML/DS 标记、字符串参数、引号、占位、调用包装/作用域及扁平工具 kind，并只合并同值重复参数；JSON 中的协议标记保持为数据，整批工具仍严格验证 Schema。九种真实格式异常重放及 77 项检查通过，原生 PowerShell 实测成功。长任务中 `error_max_turns` 的底层原因仍待后续日志确认；具体任务的中断排查记录只保存在本机。
 
 Harness 已能显示推导的本轮 token 用量、tok/s 和上下文压力。SDK 的 token 字段仍全为 0，Bridge 使用 `context_usage_ratio × 策略窗口` 和 text/thinking delta 个数推导；既有受控 Flash 样本支持这一口径，但不是官方 token 计数保证，也未证明 Pro 的每个 delta 必定等于一个 token。缺任一信号或分块异常时不发送 usage。Qoder 不报告缓存命中，默认不发缓存字段（Harness 此时把全部输入标成「未缓存输入」）；`--cache-usage estimate` 可发送按会话前缀估算的缓存读取数，属估算值。详见[更新、流式与用量](docs/update-and-streaming.md#token-与缓存)；`npm.cmd run metrics` 汇总 token、tok/s、Credits、延迟与本地复用次数。
 

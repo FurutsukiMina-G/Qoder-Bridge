@@ -5,7 +5,7 @@ import { baseOptions, isolateSession, type Config } from './client.js';
 import { InputQueue } from './queue.js';
 import { selectModel } from './model.js';
 import { Telemetry, safeError } from './telemetry.js';
-import { type ChatRequest, type Decision, conversationPrompt, parseDecision, toolDefinitions } from './compat.js';
+import { type ChatRequest, type Decision, type DecisionRepair, conversationPrompt, parseDecision, toolDefinitions } from './compat.js';
 import { hasConversationPrefix, routeConversation } from './routing.js';
 import { abortable } from './async.js';
 import { prefixCacheEstimate, withCachedTokens, ZERO_USAGE, type OpenAIUsage } from './usage.js';
@@ -25,7 +25,7 @@ type RecordSession = {
   lastPromptTokens: number | null;
 };
 const MAX_SESSIONS = 8;
-const IDLE_MS = 20 * 60_000;
+const IDLE_MS = 60 * 60_000;
 const SWEEP_MS = 60_000;
 export class QoderPool {
   private sessions = new Map<string, RecordSession>();
@@ -36,7 +36,13 @@ export class QoderPool {
   private prewarmError: string | null = null;
   // Idle SDK runtimes are otherwise released only when another session is opened.
   private sweeper = setInterval(() => this.sweepIdle(), SWEEP_MS);
-  constructor(readonly config: Config) { this.sweeper.unref(); }
+  constructor(readonly config: Config) {
+    this.sweeper.unref();
+    if (config.sessionIdleMs !== undefined && (!Number.isSafeInteger(config.sessionIdleMs) || config.sessionIdleMs < 60_000)) {
+      clearInterval(this.sweeper);
+      throw new Error('sessionIdleMs must be an integer >=60000');
+    }
+  }
   private primeNext(): Promise<RecordSession> {
     if (this.nextWarm) return this.nextWarm;
     const pending = this.open();
@@ -85,7 +91,7 @@ export class QoderPool {
     record.queue.close(); record.warm.close(); record.controller.abort();
   }
   private sweepIdle() {
-    for (const record of this.sessions.values()) if (!record.busy && Date.now() - record.touched > IDLE_MS) this.close(record);
+    for (const record of this.sessions.values()) if (!record.busy && Date.now() - record.touched > (this.config.sessionIdleMs ?? IDLE_MS)) this.close(record);
     // A failed startup prewarm (e.g. network not ready at logon) retries until the runtime is reachable.
     if (this.prewarmError && !this.nextWarm) void this.primeNext();
   }
@@ -209,8 +215,9 @@ export class QoderPool {
       else if (report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
       let decision: ReturnType<typeof parseDecision> | null = null;
       let decisionError: string | null = null;
+      const decisionRepairs: DecisionRepair[] = [];
       if (!inferenceError) try {
-        decision = parseDecision(telemetry.text, request);
+        decision = parseDecision(telemetry.text, request, repair => decisionRepairs.push(repair));
         hooks.validateDecision?.(decision);
       } catch (error) { decisionError = safeError(error); decision = null; }
       if (decision) {
@@ -237,7 +244,7 @@ export class QoderPool {
         client_session_key_present: Boolean(request.prompt_cache_key),
         client_session_key_hash: request.prompt_cache_key ?
           createHash('sha256').update(request.prompt_cache_key).digest('hex').slice(0, 12) : null,
-        model_policy_calls: turnPolicies,
+        model_policy_calls: turnPolicies, decision_repairs: decisionRepairs,
         history_mode: prefix ? 'delta' : 'full', sent_message_count: delta.length,
         credits_delta: deltaCredits, credits_delta_source: report.total_session_credits !== null ? 'cumulative_delta' : report.request_credits_source,
         local_response_replay: false, client_usage: clientUsage, cache_estimate_tokens: cacheEstimate,
