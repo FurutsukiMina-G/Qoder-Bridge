@@ -34,7 +34,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
   'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
-  'missing_calls_parameter_wrapper' | 'generic_shorthand_name'; tool: string; parameter: string };
+  'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -496,6 +496,36 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   return Decision.parse(parsed.length === 1 ? { kind: 'tool_call', ...parsed[0] } :
     { kind: 'tool_calls', calls: parsed });
 }
+function plainWriteParametersDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
+  const start = /^<｜｜DSML｜｜\s*(calls|tool_calls)>\s*<｜｜DSML｜｜\s*invoke name="write">\s*(?=<parameter\b)/.exec(text);
+  if (!start) return null;
+  const provided = request.tools?.filter(tool => tool.function.name === 'write') ?? [];
+  const schema = provided.length === 1 ? provided[0]!.function.parameters as
+    { properties?: Record<string, { type?: unknown }> } | undefined : undefined;
+  if (schema?.properties?.file_path?.type !== 'string' || schema.properties.content?.type !== 'string')
+    throw new Error('Plain write parameters require one supplied tool with declared string fields');
+  let cursor = start[0].length;
+  const args: Record<string, unknown> = {};
+  for (const name of ['file_path', 'content']) {
+    const opening = `<parameter name="${name}">`;
+    if (!text.startsWith(opening, cursor)) throw new Error(`Plain write parameter is missing or out of order: ${name}`);
+    cursor += opening.length;
+    const end = text.indexOf('</parameter>', cursor);
+    if (end < 0) throw new Error(`Plain write parameter is incomplete: ${name}`);
+    // These fields are strings in the supplied schema. Keep every byte;
+    // JSON/XML-looking text in their values must never become another call.
+    args[name] = text.slice(cursor, end);
+    cursor = end + '</parameter>'.length;
+    cursor += /^\s*/.exec(text.slice(cursor))![0].length;
+  }
+  // The recorded mixed envelope has one plain invoke close followed by
+  // empty DSML parameter/invoke closes. Require this entire exact suffix;
+  // never finish a value, discard another call, or scan past a field close.
+  const tail = /^<\/invoke>\s*<\/｜｜DSML｜｜\s*parameter>\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(text.slice(cursor));
+  if (!tail || tail[1] !== start[1]) throw new Error('Plain write envelope has extra or incomplete closing data');
+  repairs.push({ kind: 'plain_write_parameters', tool: 'write', parameter: 'arguments' });
+  return Decision.parse({ kind: 'tool_call', name: 'write', arguments: args });
+}
 function genericShorthandNameDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
   const start = /<｜｜DSML｜｜\s*(calls|tool_calls)>\s*<｜｜DSML｜｜\s*invoke\s+name="tool_call">\s*<｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false">\s*/.exec(text);
   if (!start || /｜｜(?:DSML|DS)｜｜|<\/?custom_tool_call\b/.test(text.slice(0, start.index))) return null;
@@ -771,7 +801,7 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const jsonOuter = /^[{[]/.test(source) || (jsonAt >= 0 && (dsmlAt < 0 || jsonAt < dsmlAt));
   let decision: Decision;
   try { decision = jsonOuter ? jsonDecision(source, request, repairs)
-    : callsParameterDecision(source, request, repairs) ?? genericShorthandNameDecision(source, request, repairs) ??
+    : plainWriteParametersDecision(source, request, repairs) ?? callsParameterDecision(source, request, repairs) ?? genericShorthandNameDecision(source, request, repairs) ??
       alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
       missingCallsOpener(source, request, repairs) ?? jsonDecision(source, request, repairs); }
   catch (error) {
