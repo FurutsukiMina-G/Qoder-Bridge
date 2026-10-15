@@ -33,7 +33,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
-  'attributed_call_envelope' | 'redundant_decision_closers'; tool: string; parameter: string };
+  'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -483,6 +483,26 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   return Decision.parse(parsed.length === 1 ? { kind: 'tool_call', ...parsed[0] } :
     { kind: 'tool_calls', calls: parsed });
 }
+function missingCallsOpener(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
+  const start = /<｜｜DSML｜｜\s*invoke\s+name="([A-Za-z_][\w.-]*)">/.exec(text);
+  if (!start) return null;
+  if (/｜｜(?:DSML|DS)｜｜|<\/?custom_tool_call\b/.test(text.slice(0, start.index)))
+    throw new Error('Unexpected protocol data before DSML invocation');
+  const fragment = text.slice(start.index);
+  const end = invocationEnd(fragment);
+  // Only the outer opener was lost in the recorded response. Require one
+  // complete invoke and its explicit outer close; never finish a parameter,
+  // discard a later call, or reinterpret JSON examples inside string values.
+  const outer = end === null ? null : /^\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(fragment.slice(end));
+  if (!outer) throw new Error('DSML invocation without its opener must have complete single-call boundaries');
+  const provided = request.tools?.filter(tool => tool.function.name === start[1]) ?? [];
+  if (provided.length !== 1) throw new Error(`Unknown or ambiguous DSML tool: ${diagnosticToolName(start[1]!)}`);
+  const decision = dsmlDecision(`<｜｜DSML｜｜ ${outer[1]}>${fragment}`, request, repairs);
+  if (decision?.kind !== 'tool_call' || decision.name !== start[1])
+    throw new Error('DSML invocation without its opener is ambiguous');
+  repairs.push({ kind: 'missing_calls_opener', tool: start[1]!, parameter: 'calls' });
+  return decision;
+}
 function encodedArguments(source: string, tool: string, request: ChatRequest, repairs: DecisionRepair[],
   repairKind: 'encoded_content_quotes' | 'packed_content_quotes' = 'encoded_content_quotes'): unknown {
   try { return parseJson(source); }
@@ -694,13 +714,14 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const source = fenced?.[1] ?? trimmed;
   const repairs: DecisionRepair[] = [];
   const jsonAt = source.search(/\{\s*"kind"\s*:\s*"(?:tool_calls|tool_call|final)"/);
-  const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);
+  const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜DSML｜｜\s*invoke\s+name="|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);
   // Protocol markers inside a JSON string are data. Select the outer
   // representation before scanning the richer DSML forms.
   const jsonOuter = /^[{[]/.test(source) || (jsonAt >= 0 && (dsmlAt < 0 || jsonAt < dsmlAt));
   let decision: Decision;
   try { decision = jsonOuter ? jsonDecision(source, request, repairs)
-    : alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ?? jsonDecision(source, request, repairs); }
+    : alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
+      missingCallsOpener(source, request, repairs) ?? jsonDecision(source, request, repairs); }
   catch (error) {
     if (error instanceof z.ZodError) {
       const detail = error.issues.slice(0, 3).map(issue =>

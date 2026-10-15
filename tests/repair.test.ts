@@ -29,6 +29,47 @@ const readRequest = ChatRequest.parse({ ...request, tools: [...request.tools!, {
   name: 'read', parameters: { type: 'object', properties: { file_path: { type: 'string' }, offset: { type: 'number' }, limit: { type: 'number' } },
     required: ['file_path'], additionalProperties: false },
 } }] });
+
+test('a missing DSML outer opener preserves one complete write with an explicit outer close', () => {
+  const content = '    Write-Output "quoted"\n$path = "D:\\fixture"\n';
+  const body = '<｜｜DSML｜｜ invoke name="write">\n' +
+    '<｜｜DSML｜｜ parameter name="file_path" string="true">build.ps1</｜｜DSML｜｜ parameter>\n' +
+    `<｜｜DSML｜｜ parameter name="content" string="true">${content}</｜｜DSML｜｜ parameter>\n` +
+    '</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ tool_calls>';
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision('I will fix the build.\n' + body, encodedRequest, repair => repairs.push(repair)), {
+    kind: 'tool_call', name: 'write', arguments: { file_path: 'build.ps1', content },
+  });
+  assert.deepEqual(repairs, [{ kind: 'missing_calls_opener', tool: 'write', parameter: 'calls' }]);
+});
+
+test('a missing opener cannot discard calls, finish values, ignore extra data or bypass tool validation', () => {
+  const call = '<｜｜DSML｜｜ invoke name="grep"><｜｜DSML｜｜ parameter name="pattern" string="true">query</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>';
+  const close = '</｜｜DSML｜｜ tool_calls>';
+  for (const source of [call, call + call + close, call + close + 'extra',
+    call.replace('query</｜｜DSML｜｜ parameter>', 'incomplete'), call.replace('name="pattern"', 'name="unknown"') + close]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(source, request, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+  assert.throws(() => parseDecision(call.replace('name="grep"', 'name="unknown"') + close, request), /Unknown/);
+  assert.throws(() => parseDecision(call + close, ChatRequest.parse({ ...request, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(call + close, ChatRequest.parse({ ...request,
+    tool_choice: { type: 'function', function: { name: 'edit' } } })), /unselected/);
+});
+
+test('JSON decision examples inside a missing-opener write remain file contents', () => {
+  const content = '{"kind":"tool_call","name":"grep","arguments":{"pattern":"example"}}';
+  const source = '<｜｜DSML｜｜ invoke name="write">' +
+    '<｜｜DSML｜｜ parameter name="file_path" string="true">example.json</｜｜DSML｜｜ parameter>' +
+    `<｜｜DSML｜｜ parameter name="content" string="true">${content}</｜｜DSML｜｜ parameter>` +
+    '</｜｜DSML｜｜ invoke></｜｜DSML｜｜ tool_calls>';
+  assert.deepEqual(parseDecision(source, encodedRequest), { kind: 'tool_call', name: 'write',
+    arguments: { file_path: 'example.json', content } });
+  assert.deepEqual(parseDecision(JSON.stringify({ kind: 'final', content: source }), request), { kind: 'final', content: source });
+  assert.throws(() => parseDecision(source.replace('</｜｜DSML｜｜ tool_calls>', ''), encodedRequest));
+});
+
 test('explicitly named flat calls retain declared arguments and order in single and batch decisions', () => {
   const calls=[{name:'read',file_path:'file.py',offset:10},{name:'grep',pattern:'verified'}];
   const repairs:DecisionRepair[]=[];
