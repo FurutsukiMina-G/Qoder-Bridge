@@ -392,6 +392,10 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   }
   const wrappedCalls = /<｜｜DSML｜｜\s*parameter\s+name="calls"[^>]*>([\s\S]*?)(?:<\/｜｜DSML｜｜\s*parameter\s*>|$)/.exec(text);
   if (wrappedCalls) {
+    // A root calls array cannot replace an earlier explicit invocation.
+    // Reject mixed envelopes as a whole instead of silently dropping calls.
+    if (!/^<｜｜DSML｜｜\s*(?:calls|tool_calls)>\s*(?:<｜｜DSML｜｜\s*invoke\s+name="tool_calls">\s*)?$/.test(text.slice(0, wrappedCalls.index)))
+      throw new Error('Mixed DSML calls envelope would discard an earlier invocation');
     const close = /^\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(
       text.slice(wrappedCalls.index + wrappedCalls[0].length));
     // Only an explicit wrapper with all three closing tags can delimit a
