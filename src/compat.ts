@@ -312,7 +312,16 @@ function invocationEnd(fragment: string): number | null {
       }
     }
     // Invoke-like text in a scalar value is data, not a call boundary.
-    const closing = /<\/｜｜DSML｜｜\s*parameter(?:\s[^>]*)?>/.exec(fragment.slice(valueStart));
+    const remainder = fragment.slice(valueStart);
+    let closing = /<\/｜｜DSML｜｜\s*parameter(?:\s[^>]*)?>/.exec(remainder);
+    const bare = /<\/｜｜DSML｜｜\s*>/.exec(remainder);
+    // Scalar fields already accept this abbreviated close during argument
+    // parsing. Recognise it for invocation boundaries only after an explicit
+    // non-string tag and a whole JSON primitive; never finish a value or
+    // reinterpret a marker inside a string/JSON object.
+    if (bare && (!closing || bare.index < closing.index) && /\bstring="false"/.test(token[0]) &&
+        /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/.test(remainder.slice(0, bare.index).trim()))
+      closing = bare;
     if (!closing) return null;
     tokens.lastIndex = valueStart + closing.index + closing[0].length;
     if (token[1] === 'name' && /^<\/｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false"\s*>$/.test(closing[0])) {
