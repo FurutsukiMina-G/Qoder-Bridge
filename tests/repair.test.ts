@@ -33,6 +33,46 @@ const readRequest = ChatRequest.parse({ ...request, tools: [...request.tools!, {
 const unwrappedCallsParameter = (calls: unknown) => '<｜｜DSML｜｜ parameter name="calls" string="false">' +
   JSON.stringify(calls) + '</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>';
 
+const genericShorthandName = (name: string, args: unknown) => '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="tool_call">' +
+  `<｜｜DSML｜｜ parameter name="arguments" string="false">${JSON.stringify(args)}</｜｜DSML｜｜ parameter>` +
+  `<｜｜DSML｜｜name" string="true">${name}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ calls>`;
+
+test('a generic call reads its explicit shorthand name only after complete JSON arguments', () => {
+  const args = { file_path: 'app.csproj', content: '<Project Sdk="Microsoft.NET.Sdk">\n</Project>\n' };
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision('Write the project.\n' + genericShorthandName('write', args), encodedRequest, repair => repairs.push(repair)),
+    { kind: 'tool_call', name: 'write', arguments: args });
+  assert.deepEqual(repairs, [{ kind: 'generic_shorthand_name', tool: 'write', parameter: 'name' }]);
+});
+
+test('generic shorthand names cannot complete arguments, discard extra calls or bypass schema and choice', () => {
+  const source = genericShorthandName('grep', { pattern: 'query' });
+  for (const invalid of [source + 'extra', source.replace('</｜｜DSML｜｜ calls>', ''),
+    source.replace('{"pattern":"query"}', '{"pattern":"cut'),
+    source.replace('string="true">grep', 'string="false">grep'),
+    source.replace('>grep</', '>grep</｜｜DSML｜｜ parameter><｜｜DSML｜｜name" string="true">edit</')]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(invalid, request, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+  assert.throws(() => parseDecision(genericShorthandName('unknown', {}), request), /Unknown/);
+  assert.throws(() => parseDecision(genericShorthandName('grep', {}), request), /pattern/);
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...request, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...request,
+    tool_choice: { type: 'function', function: { name: 'edit' } } })), /unselected/);
+});
+
+test('shorthand-looking or canonical tool names inside JSON remain opaque file data', () => {
+  const content = '<｜｜DSML｜｜ parameter name="name" string="true">grep</｜｜DSML｜｜ parameter>' +
+    '<｜｜DSML｜｜name" string="true">unknown</｜｜DSML｜｜ parameter>';
+  const source = genericShorthandName('write', { file_path: 'literal.txt', content });
+  assert.deepEqual(parseDecision(source, encodedRequest), { kind: 'tool_call', name: 'write', arguments: { file_path: 'literal.txt', content } });
+  assert.deepEqual(parseDecision(JSON.stringify({ kind: 'final', content: source }), request), { kind: 'final', content: source });
+  const conflict = ChatRequest.parse({ ...encodedRequest, tools: [...encodedRequest.tools!,
+    { type: 'function', function: { name: 'tool_call', parameters: { type: 'object' } } }] });
+  assert.throws(() => parseDecision(source, conflict), /conflicts/);
+});
+
 test('a complete calls parameter without opening wrappers preserves the entire batch and literal marker data', () => {
   const pattern = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="unknown"> literal ' +
     '{"kind":"final","content":"example"} <｜｜DS｜｜tool_calls｜｜DS｜｜';

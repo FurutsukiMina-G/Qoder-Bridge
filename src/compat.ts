@@ -34,7 +34,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
   'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
-  'missing_calls_parameter_wrapper'; tool: string; parameter: string };
+  'missing_calls_parameter_wrapper' | 'generic_shorthand_name'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
@@ -484,6 +484,26 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   return Decision.parse(parsed.length === 1 ? { kind: 'tool_call', ...parsed[0] } :
     { kind: 'tool_calls', calls: parsed });
 }
+function genericShorthandNameDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
+  const start = /<｜｜DSML｜｜\s*(calls|tool_calls)>\s*<｜｜DSML｜｜\s*invoke\s+name="tool_call">\s*<｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false">\s*/.exec(text);
+  if (!start || /｜｜(?:DSML|DS)｜｜|<\/?custom_tool_call\b/.test(text.slice(0, start.index))) return null;
+  let args: ReturnType<typeof objectRange>;
+  try { args = objectRange(text, start.index + start[0].length); }
+  catch { return null; } // Let the normal parser reject malformed arguments.
+  const tail = text.slice(args.end);
+  if (!/^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name"/.test(tail)) return null;
+  // The name is an explicit, separately closed field after an entire JSON
+  // arguments object. Do not scan or rewrite any protocol text inside args.
+  const name = /^\s*<\/｜｜DSML｜｜\s*parameter>\s*<｜｜DSML｜｜\s*name"\s+string="true">([A-Za-z_][\w.-]*)<\/｜｜DSML｜｜\s*parameter>\s*(?:<\/｜｜DSML｜｜\s*invoke>\s*)?<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(tail);
+  if (!name || name[2] !== start[1]) throw new Error('Generic DSML shorthand name has extra or incomplete boundaries');
+  if (request.tools?.some(tool => tool.function.name === 'tool_call'))
+    throw new Error('Generic DSML wrapper conflicts with a supplied tool');
+  if ((request.tools?.filter(tool => tool.function.name === name[1]) ?? []).length !== 1)
+    throw new Error(`Unknown or ambiguous DSML tool: ${diagnosticToolName(name[1]!)}`);
+  const decision = Decision.parse({ kind: 'tool_call', name: name[1], arguments: args.value });
+  repairs.push({ kind: 'generic_shorthand_name', tool: name[1]!, parameter: 'name' });
+  return decision;
+}
 function callsParameterDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
   const start = /<｜｜DSML｜｜\s*parameter\s+name="calls"[^>]*>/.exec(text);
   if (!start || /｜｜(?:DSML|DS)｜｜|<\/?custom_tool_call\b/.test(text.slice(0, start.index))) return null;
@@ -739,7 +759,8 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const jsonOuter = /^[{[]/.test(source) || (jsonAt >= 0 && (dsmlAt < 0 || jsonAt < dsmlAt));
   let decision: Decision;
   try { decision = jsonOuter ? jsonDecision(source, request, repairs)
-    : callsParameterDecision(source, request, repairs) ?? alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
+    : callsParameterDecision(source, request, repairs) ?? genericShorthandNameDecision(source, request, repairs) ??
+      alternateDsDecision(source, request, repairs) ?? dsmlDecision(source, request, repairs) ??
       missingCallsOpener(source, request, repairs) ?? jsonDecision(source, request, repairs); }
   catch (error) {
     if (error instanceof z.ZodError) {
