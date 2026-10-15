@@ -33,6 +33,46 @@ const readRequest = ChatRequest.parse({ ...request, tools: [...request.tools!, {
 const unwrappedCallsParameter = (calls: unknown) => '<｜｜DSML｜｜ parameter name="calls" string="false">' +
   JSON.stringify(calls) + '</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>';
 
+const closedCallsEnvelope = (array: string) => '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="tool_calls">' +
+  '<｜｜DSML｜｜ parameter name="calls" string="false">' + array +
+  '</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>';
+
+test('a fully closed DSML envelope can delimit complete edit calls missing only the final array close', () => {
+  const calls = [
+    { name: 'edit', arguments: { file_path: 'first.cs', old_string: '[DllImport("native.dll")]\nvoid Before();', new_string: '[DllImport("native.dll")]\nvoid After();' } },
+    { name: 'edit', arguments: { file_path: 'second.cs', old_string: '    int count;\n', new_string: '    /// <summary>计数 [] {}</summary>\n    int count;\n' } },
+  ];
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision(closedCallsEnvelope(JSON.stringify(calls).slice(0, -1)), request, repair => repairs.push(repair)),
+    { kind: 'tool_calls', calls });
+  assert.deepEqual(repairs, [{ kind: 'decision_wrapper_close', tool: 'edit', parameter: 'calls' }]);
+});
+
+test('missing array-close recovery needs the entire explicit envelope and never completes arguments or drops data', () => {
+  const calls = [{ name: 'grep', arguments: { pattern: 'first' } }, { name: 'grep', arguments: { pattern: 'second' } }];
+  const array = JSON.stringify(calls);
+  const source = closedCallsEnvelope(array.slice(0, -1));
+  for (const invalid of [closedCallsEnvelope(array.slice(0, -2)), closedCallsEnvelope(array.slice(0, -3)),
+    closedCallsEnvelope(array.slice(0, -1) + ','), source + 'extra', source.replace('</｜｜DSML｜｜ parameter>', ''),
+    source.replace('</｜｜DSML｜｜ invoke>', ''), source.replace('</｜｜DSML｜｜ calls>', ''),
+    source.replace('invoke name="tool_calls"', 'invoke name="grep"'), source.replace('string="false"', 'string="true"')]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(invalid, request, repair => repairs.push(repair)), invalid);
+    assert.deepEqual(repairs, []);
+  }
+});
+
+test('recovered array tails still enforce every supplied tool schema and choice', () => {
+  const source = closedCallsEnvelope(JSON.stringify([{ name: 'grep', arguments: { pattern: 'valid' } },
+    { name: 'edit', arguments: { file_path: 'file.cs' } }]).slice(0, -1));
+  assert.throws(() => parseDecision(source, request), /old_string|schema/);
+  const valid = closedCallsEnvelope(JSON.stringify([{ name: 'grep', arguments: { pattern: 'valid' } }]).slice(0, -1));
+  assert.throws(() => parseDecision(valid, ChatRequest.parse({ ...request, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(valid.replace('"grep"', '"unknown"'), request), /Unknown/);
+  assert.throws(() => parseDecision(valid, ChatRequest.parse({ ...request,
+    tool_choice: { type: 'function', function: { name: 'edit' } } })), /unselected/);
+});
+
 const genericShorthandName = (name: string, args: unknown) => '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="tool_call">' +
   `<｜｜DSML｜｜ parameter name="arguments" string="false">${JSON.stringify(args)}</｜｜DSML｜｜ parameter>` +
   `<｜｜DSML｜｜name" string="true">${name}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ calls>`;

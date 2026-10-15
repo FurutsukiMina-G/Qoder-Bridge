@@ -183,7 +183,7 @@ function alternateDsDecision(text: string, request: ChatRequest, repairs: Decisi
     repairs.push({ kind: marker === 'DSML' ? 'repeated_dsml' : 'alternate_ds', tool: name, parameter: 'call' });
   }
 }
-function callsArray(text: string, repairs: DecisionRepair[]): unknown {
+function callsArray(text: string, repairs: DecisionRepair[], completeEnvelope = false): unknown {
   try { return parseJson(text); }
   catch (original) {
     // Some SDK-formatted call arrays carry an extra closing brace after the
@@ -196,7 +196,10 @@ function callsArray(text: string, repairs: DecisionRepair[]): unknown {
         if (Array.isArray(recovered)) return recovered;
       } catch { /* A complete array may still have a missing call wrapper. */ }
     }
-    const restored = missingCallClosures(`{"kind":"tool_calls","calls":${text.trim()}}`);
+    // An added outer brace must never masquerade as a missing call close.
+    // Use the closed wrapper only when the array itself already ended.
+    const restored = (/\]\s*$/.test(text) ? missingCallClosures(`{"kind":"tool_calls","calls":${text.trim()}}`) : null) ??
+      (completeEnvelope ? missingCallClosures(`{"kind":"tool_calls","calls":${text.trim()}`) : null);
     if (restored) {
       repairs.push(...restored.repairs);
       return (restored.value as { calls: unknown[] }).calls;
@@ -373,7 +376,7 @@ function unwrappedCalls(tail: string, repairs: DecisionRepair[], request: ChatRe
   return calls;
 }
 function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
-  const marker = /<｜｜DSML｜｜\s*(?:calls|tool_calls)>/.exec(text);
+  const marker = /<｜｜DSML｜｜\s*(calls|tool_calls)>/.exec(text);
   const markerAt = marker?.index ?? -1;
   if (markerAt < 0) return null;
   text = text.slice(markerAt);
@@ -389,7 +392,16 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   }
   const wrappedCalls = /<｜｜DSML｜｜\s*parameter\s+name="calls"[^>]*>([\s\S]*?)(?:<\/｜｜DSML｜｜\s*parameter\s*>|$)/.exec(text);
   if (wrappedCalls) {
-    const raw = callsArray(wrappedCalls[1]!.trim(), repairs) as unknown;
+    const close = /^\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(
+      text.slice(wrappedCalls.index + wrappedCalls[0].length));
+    // Only an explicit wrapper with all three closing tags can delimit a
+    // calls array whose final ']' was omitted. Reuse the existing EOF rule
+    // for complete call objects; incomplete arguments or later calls fail.
+    const completeEnvelope = Boolean(close && close[1] === marker?.[1] &&
+      /^<｜｜DSML｜｜\s*(?:calls|tool_calls)>\s*<｜｜DSML｜｜\s*invoke\s+name="tool_calls">\s*$/.test(text.slice(0, wrappedCalls.index)) &&
+      /^<｜｜DSML｜｜\s*parameter\s+name="calls"\s+string="false"\s*>/.test(wrappedCalls[0]) &&
+      /<\/｜｜DSML｜｜\s*parameter\s*>$/.test(wrappedCalls[0]));
+    const raw = callsArray(wrappedCalls[1]!.trim(), repairs, completeEnvelope) as unknown;
     if (!Array.isArray(raw) || !raw.length) throw new Error('DSML calls parameter is empty or invalid');
     const calls = raw.map(item => {
       if (!item || typeof item !== 'object') throw new Error('DSML tool call is invalid');
