@@ -33,7 +33,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
-  'attributed_call_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
+  'attributed_call_envelope' | 'plain_tool_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
   'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
@@ -728,6 +728,17 @@ function jsonDecision(text: string, request: ChatRequest, repairs: DecisionRepai
       throw new Error('Custom tool envelope must have only explicit name and complete arguments');
     const decision = decisionObject({ kind: 'tool_call', name: inner.name, arguments: inner.arguments }, request, repairs);
     repairs.push({ kind: 'custom_tool_envelope', tool: String(inner.name), parameter: 'call' });
+    return decision;
+  }
+  // An observed plain XML envelope carries a complete explicit tool name
+  // and JSON arguments. Accept only this entire single-call representation;
+  // incomplete envelopes and extra calls must never turn into final prose.
+  if (/(?:^|\n)[\t ]*<\/?tool_call\b/.test(text)) {
+    const plain = /^<tool_call>\s*<parameter name="name">([^<>]+)<\/parameter>\s*<parameter name="arguments">([\s\S]+)<\/parameter>\s*<\/tool_call>$/.exec(text);
+    if (!plain) throw new Error('Plain tool envelope requires one complete name and arguments pair');
+    const name = plain[1]!.trim();
+    const decision = decisionObject({ kind: 'tool_call', name, arguments: parseJson(plain[2]!) }, request, repairs);
+    repairs.push({ kind: 'plain_tool_envelope', tool: name, parameter: 'call' });
     return decision;
   }
   let decoded: unknown;

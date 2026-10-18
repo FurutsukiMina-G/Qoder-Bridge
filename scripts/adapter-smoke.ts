@@ -1,10 +1,11 @@
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { createBridgeServer } from '../src/server.js';
 import type { runProbe } from '../src/client.js';
 const shellRoot = resolve(process.argv[2] ?? '.runtime/dsh-current-shell');
+const reportPath = resolve(process.argv[3] ?? 'reports/adapter-smoke.json');
 const packageRoot = resolve(shellRoot, 'dsh/node_modules/@earendil-works/pi-ai');
 const adapterPath = resolve(packageRoot, 'dist/api/openai-completions.js');
 const adapterVersion = JSON.parse(await readFile(resolve(packageRoot, 'package.json'), 'utf8')).version;
@@ -58,6 +59,7 @@ for (const testCase of ['cached-final', 'uncached-final', 'tool-call', 'invalid-
       eventTypes: events.map(event => event.type), usage: done?.message?.usage ?? null });
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 }
-await writeFile('reports/adapter-smoke.json', JSON.stringify({ checkedAt: new Date().toISOString(),
+await mkdir(dirname(reportPath), { recursive: true });
+await writeFile(reportPath, JSON.stringify({ checkedAt: new Date().toISOString(),
   adapterPath, adapterVersion, checks }, null, 2));
 console.log(JSON.stringify(checks, null, 2));

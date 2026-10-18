@@ -95,7 +95,11 @@ test('thin session disables inherited behavior and uses CN official authenticati
   assert.equal(options.systemPrompt, 'test prompt'); assert.equal(options.maxTurns, 1);
   assert.equal(options.strictMcpConfig, true); assert.equal(options.auth?.type, 'qodercli');
   assert.equal(options.env?.USERPROFILE, process.env.USERPROFILE);
-  assert.equal(options.env?.PATH, process.env.PATH);
+  // Windows preserves the spelling of Path while process.env lookup is
+  // case-insensitive; spreading it into a plain object loses that lookup.
+  const childPath = Object.entries(options.env ?? {}).find(([key]) =>
+    process.platform === 'win32' ? key.toUpperCase() === 'PATH' : key === 'PATH')?.[1];
+  assert.equal(childPath, process.env.PATH);
   assert.equal(options.env?.QODERCN_EXPOSE_REQUEST_ID, 'true');
 });
 test('errors redact configured secrets', () => {

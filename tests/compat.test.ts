@@ -83,6 +83,43 @@ test('unsupported marker examples remain literal data in final JSON and inline p
   const prose = 'The invalid marker <｟DSML｠｠ calls> must be reported as an error.';
   assert.deepEqual(parseDecision(prose, req), { kind: 'final', content: prose });
 });
+
+test('complete plain XML tool envelopes preserve explicit names and JSON arguments', () => {
+  const req = ChatRequest.parse(task);
+  const source = '<tool_call>\n<parameter name="name">read_file</parameter>\n' +
+    '<parameter name="arguments">{"path":"a{b}.txt"}</parameter>\n</tool_call>';
+  const repairs: unknown[] = [];
+  assert.deepEqual(parseDecision(source, req, repair => repairs.push(repair)),
+    { kind: 'tool_call', name: 'read_file', arguments: { path: 'a{b}.txt' } });
+  assert.deepEqual(repairs, [{ kind: 'plain_tool_envelope', tool: 'read_file', parameter: 'call' }]);
+});
+
+test('plain XML envelopes reject incomplete, duplicate, invalid and additional calls atomically', () => {
+  const req = ChatRequest.parse(task);
+  const source = '<tool_call><parameter name="name">read_file</parameter>' +
+    '<parameter name="arguments">{"path":"file.txt"}</parameter></tool_call>';
+  for (const bad of [source.replace('</tool_call>', ''), source + source,
+    source.replace('read_file', 'Bash'), source.replace('{"path":"file.txt"}', '{"path":1}'),
+    source.replace('{"path":"file.txt"}', '{}'), source.replace('{"path":"file.txt"}', '{"path":'),
+    source.replace('<parameter name="name">read_file</parameter>', ''),
+    source.replace('<parameter name="arguments">', '<parameter name="name">read_file</parameter><parameter name="arguments">'),
+    'Starting a tool call.\n' + source]) {
+    const repairs: unknown[] = [];
+    assert.throws(() => parseDecision(bad, req, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+});
+
+test('plain XML markers in JSON string data and inline prose remain literal', () => {
+  const req = ChatRequest.parse(task);
+  const literal = '<tool_call>\n<parameter name="name">read_file</parameter>\n</tool_call>';
+  const final = { kind: 'final', content: literal };
+  assert.deepEqual(parseDecision(JSON.stringify(final), req), final);
+  const call = { kind: 'tool_call', name: 'read_file', arguments: { path: literal } };
+  assert.deepEqual(parseDecision(JSON.stringify(call), req), call);
+  const prose = 'The marker <tool_call> is part of this sentence.';
+  assert.deepEqual(parseDecision(prose, req), { kind: 'final', content: prose });
+});
 test('DSML direct scalar fields and generic tool_call wrapper keep native tool arguments', () => {
   const req = ChatRequest.parse({ model: 'qoder-deepseek-flash', messages: [{ role: 'user', content: 'write fixture' }],
     tools: [{ type: 'function', function: { name: 'write', parameters: {
