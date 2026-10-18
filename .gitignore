@@ -14,6 +14,9 @@ scripts/audit-current-run.ts
 scripts/audit-recent-runs.ts
 scripts/replay-bad-decisions.ts
 scripts/verify-upgrade.ts
+# Interruption analyses and log audits of real Harness tasks; project-named notes go in .git/info/exclude.
+docs/interruptions-*.md
+docs/log-audit-*.md
 
 # Never commit logs, usage records, or credentials even if written outside the folders above.
 *.log
