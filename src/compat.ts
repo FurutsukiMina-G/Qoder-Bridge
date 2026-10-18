@@ -807,6 +807,12 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(trimmed);
   const source = fenced?.[1] ?? trimmed;
+  // This observed alternate marker is not a supported envelope. Reject it
+  // before a partial call or plain-text final can hide unexecuted tool intent.
+  // A leading JSON object/array owns its strings, including markup examples.
+  if (!/^[{[]/.test(source) &&
+      /(?:^|\n)[\t ]*<\/?｟DSML｠+[\t ]*(?:calls|tool_calls|invoke|parameter)\b/.test(source))
+    throw new Error('Malformed DSML tool envelope: unsupported marker');
   const repairs: DecisionRepair[] = [];
   const jsonAt = source.search(/\{\s*"kind"\s*:\s*"(?:tool_calls|tool_call|final)"/);
   const dsmlAt = source.search(/<｜｜DSML｜｜\s*(?:calls|tool_calls)>|<｜｜DSML｜｜\s*(?:invoke\s+name="|parameter\s+name="calls")|<｜｜(?:DS|DSML)｜｜\s*tool_calls\s*｜｜(?:DS|DSML)｜｜/);

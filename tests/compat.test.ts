@@ -58,6 +58,31 @@ test('DSML tool decisions from Qoder become validated Harness tool calls', () =>
   assert.throws(() => parseDecision('<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="unknown">' +
     '<｜｜DSML｜｜ parameter name="arguments">{}', req));
 });
+
+test('unsupported fullwidth DSML tool envelopes cannot become final text or partial tool batches', () => {
+  const req = ChatRequest.parse(task);
+  const malformed = '<｟DSML｠｠ calls>\n<｟DSML｠｠ invoke name="read_file">\n' +
+    '<｟DSML｠｠ parameter name="arguments" string="false">{"path":"sentinel.txt"}｟DSML｠｠ parameter>\n' +
+    '</｟DSML｠｠ invoke>\n</｟DSML｠｠ calls>';
+  const canonical = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="read_file">' +
+    '<｜｜DSML｜｜ parameter name="arguments">{"path":"first.txt"}</｜｜DSML｜｜ parameter>' +
+    '</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>';
+  for (const source of [malformed, 'I will inspect the file.\n' + malformed, canonical + '\n' + malformed]) {
+    const repairs: unknown[] = [];
+    assert.throws(() => parseDecision(source, req, repair => repairs.push(repair)), /Malformed DSML tool envelope/);
+    assert.deepEqual(repairs, []);
+  }
+});
+
+test('unsupported marker examples remain literal data in final JSON and inline prose', () => {
+  const req = ChatRequest.parse(task);
+  const content = '<｟DSML｠｠ calls>\n<｟DSML｠｠ invoke name="read_file">';
+  const value = { kind: 'final', content };
+  for (const source of [JSON.stringify(value), JSON.stringify(value, null, 2),
+    '```json\n' + JSON.stringify(value) + '\n```']) assert.deepEqual(parseDecision(source, req), value);
+  const prose = 'The invalid marker <｟DSML｠｠ calls> must be reported as an error.';
+  assert.deepEqual(parseDecision(prose, req), { kind: 'final', content: prose });
+});
 test('DSML direct scalar fields and generic tool_call wrapper keep native tool arguments', () => {
   const req = ChatRequest.parse({ model: 'qoder-deepseek-flash', messages: [{ role: 'user', content: 'write fixture' }],
     tools: [{ type: 'function', function: { name: 'write', parameters: {
