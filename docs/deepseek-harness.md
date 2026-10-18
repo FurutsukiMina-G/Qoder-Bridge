@@ -22,10 +22,9 @@ Harness 当前模型目录中已出现该 Provider 的两个模型，可选择 `
 
 Bridge 仅监听 `127.0.0.1:8646`，需要 Bearer 密钥。`GET /health` 返回后台服务、并发/排队计数和能力；`GET /v1/models` 和 `POST /v1/chat/completions` 需要认证。当前由 Windows 计划任务 `QoderBridge-8646` 独立运行，在登录后启动。旧 8642–8645 服务已退出。`npm.cmd run status` 从实时健康接口读取 PID。
 
-从项目目录重新启动或停止服务：
+在仓库根目录重新启动或停止服务：
 
 ```powershell
-cd D:\GPT-work\qoderbridge
 npm.cmd run build
 & .\scripts\start-server.ps1
 Invoke-RestMethod http://127.0.0.1:8646/health

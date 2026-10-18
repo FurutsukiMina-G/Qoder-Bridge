@@ -1,6 +1,6 @@
 # 2026-09-30 官方桌面升级与 Bridge 验收
 
-已在原安装路径 `D:\DSH\DeepSeek Harness` 将官方桌面端从 `0.1.7-rc.2` 更新为 `0.2.0-rc.2`。新桌面已启动，QoderBridge 的 `8646` 服务持续运行，Flash / Pro 均可选择，保留原默认 Flash。
+已在原安装路径将官方桌面端从 `0.1.7-rc.2` 更新为 `0.2.0-rc.2`。新桌面已启动，QoderBridge 的 `8646` 服务持续运行，Flash / Pro 均可选择，保留原默认 Flash。
 
 ## 安装与数据
 
@@ -40,10 +40,9 @@ token 仍是 Bridge 从 Qoder 上下文比例与流式 delta 推导的用量；�
 - `reports/adapter-smoke.json`：新版 pi-ai 离线适配检查。
 - `.runtime/update-backup-20260930/manifest.json`：私人数据的逐文件哈希与链接目标。
 
-以下命令只读取已完成的测试与本机日志，不发新模型请求（末尾可附上被丢弃的初始测试会话 ID，具体值记在本机笔记）：
+以下命令在仓库根目录运行，只读取已完成的测试与本机日志，不发新模型请求（末尾可附上被丢弃的初始测试会话 ID）：
 
 ```powershell
-cd D:\GPT-work\qoderbridge
 npm.cmd run status
 node --import tsx scripts/adapter-smoke.ts
 node --import tsx scripts/verify-desktop-update.ts .runtime/update-backup-20260930 .runtime/desktop-update-cases-20260930.json .runtime/dsh-current-shell [初始测试会话 ID ...]

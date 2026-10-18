@@ -30,8 +30,9 @@
 
 ## 复现
 
+在仓库根目录运行：
+
 ```powershell
-cd D:\GPT-work\qoderbridge
 npm.cmd run models
 npm.cmd run probe -- "Reply with exactly OK." --json --session-settings config/thin-cn.json
 npm.cmd run gate -- --strategy hook --json --session-settings config/thin-cn.json

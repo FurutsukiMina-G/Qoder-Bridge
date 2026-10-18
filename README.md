@@ -30,7 +30,8 @@ Harness 已能显示推导的本轮 token 用量、tok/s 和上下文压力。SD
 ## 安装与登录（PowerShell）
 
 ```powershell
-cd D:\GPT-work\qoderbridge
+git clone https://github.com/FurutsukiMina-G/Qoder-Bridge.git
+cd Qoder-Bridge
 npm.cmd ci
 npm.cmd run qoder:login
 npm.cmd run models

@@ -16,10 +16,9 @@ Bridge 向 `reports/tasks.ndjson` 追加每次 Harness 请求的记录；`teleme
 
 系统与 developer 消息只记角色、长度和哈希，不记正文。Harness 会话键只存短哈希；Bridge 密钥、Qoder 凭据和认证头不会写入。摘录可能仍包含任务文本、文件内容或命令输出，所以日志保存在本机被 `.gitignore` 排除的 `reports/` 目录，不应直接公开。
 
-查看当前服务与按会话汇总：
+在仓库根目录查看当前服务与按会话汇总：
 
 ```powershell
-cd D:\GPT-work\qoderbridge
 npm.cmd run status
 npm.cmd run tasks:report
 npm.cmd run tasks:report -- --session <DeepSeek Harness 的 sessionId>
