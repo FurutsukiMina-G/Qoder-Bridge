@@ -33,7 +33,9 @@ test('one request regenerates a rejected decision in the same context with exact
   assert.match(prompts[1]!,/No tool in that rejected output ran/);assert.match(prompts[1]!,/new_string/);
   assert.ok(!prompts[1]!.includes(req.messages[0]!.content as string),'do not resend full task/history on correction');
   assert.equal(result.turn.model_requests,2);assert.equal(result.turn.credits_delta,0.2);
-  assert.deepEqual(result.turn.client_usage,{prompt_tokens:200,completion_tokens:10,total_tokens:210});
+  // Hosts treat a call's usage as its context size: final prompt with all output; accounting keeps the sum.
+  assert.deepEqual(result.turn.client_usage,{prompt_tokens:100,completion_tokens:10,total_tokens:110});
+  assert.deepEqual(result.turn.normalized_usage,{prompt_tokens:200,completion_tokens:10,total_tokens:210});
   assert.equal(result.recovery.evidence[0]!.response,bad);
 });
 

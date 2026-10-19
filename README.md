@@ -14,7 +14,9 @@ Harness 已更新到官方桌面端 `0.2.0-rc.2`，Bridge 使用 `8646`。新版
 
 2026-10-01 已修复实际出现的 DSML/DS 标记、字符串参数、引号、占位、调用包装/作用域及扁平工具 kind，并只合并同值重复参数；JSON 中的协议标记保持为数据，整批工具仍严格验证 Schema。九种真实格式异常重放及 77 项检查通过，原生 PowerShell 实测成功。长任务中 `error_max_turns` 的底层原因仍待后续日志确认；具体任务的中断排查记录只保存在本机。
 
-Harness 已能显示推导的本轮 token 用量、tok/s 和上下文压力。SDK 的 token 字段仍全为 0，Bridge 使用 `context_usage_ratio × 策略窗口` 和 text/thinking delta 个数推导；既有受控 Flash 样本支持这一口径，但不是官方 token 计数保证，也未证明 Pro 的每个 delta 必定等于一个 token。缺任一信号或分块异常时不发送 usage。Qoder 不报告缓存命中，默认不发缓存字段（Harness 此时把全部输入标成「未缓存输入」）；`--cache-usage estimate` 可发送按会话前缀估算的缓存读取数，属估算值。详见[更新、流式与用量](docs/update-and-streaming.md#token-与缓存)；`npm.cmd run metrics` 汇总 token、tok/s、Credits、延迟与本地复用次数。
+Harness 已能显示本轮 token 用量、缓存命中、tok/s 和上下文压力。SDK 的 token 字段仍全为 0，Bridge 使用 `context_usage_ratio × 策略窗口` 和 text/thinking delta 个数计量；按 DeepSeek 官方价目，Flash 与 Pro 的账单都能由这一计量解释到几个 token 以内，二者相互印证，但它仍不是官方 token 字段。Qoder 不报告缓存命中，Bridge 默认按每个请求的 Credits 与 DeepSeek 官方价目（含高峰/空闲时段）反解命中数（`--cache-usage billing`），不能解释账单时回退到会话前缀估算并标注来源。详见[计费反推缓存、推理守卫与 Harness 内调节](docs/billing-and-reasoning.md)；`npm.cmd run metrics` 汇总 token、缓存、高峰时段花费、tok/s、Credits 与延迟。
+
+推理等级（Flash low/high/max、Pro high/max）和上下文窗口（1M/400K/200K 对应不同模型 ID）可直接在 Harness 的模型选择处切换。单次尝试在出现正文前推理超过 24k token 时，Bridge 会中断并以 high 等级重试，避免推理耗尽输出预算造成的中断和浪费；SDK 重试与长时间上游静默会以状态行发送，避免被 Harness 的流空闲看门狗断开。
 
 ## 当前状态
 

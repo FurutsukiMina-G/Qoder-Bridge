@@ -12,8 +12,13 @@ export interface Config extends Selection {
   auth: 'auto' | 'cli' | 'pat'; timeout: number; cliPath?: string; proxy?: string;
   system: string; strategy: Strategy;
   sessionSettings?: string;
-  /** Qoder reports no cache counts; 'estimate' sends the session-prefix estimate as cached_tokens. */
-  cacheUsage?: 'none' | 'estimate';
+  /**
+   * Qoder reports no cache counts. 'billing' (serve default) derives cached_tokens from each request's billed
+   * Credits, falling back to the session-prefix estimate; 'estimate' always sends that estimate; 'none' omits it.
+   */
+  cacheUsage?: 'none' | 'estimate' | 'billing';
+  /** Interrupt a turn whose reasoning reaches this many tokens before any output, then retry at lower effort. 0 disables. */
+  reasoningGuardTokens?: number;
   /** Retain idle conversation context through human approval waits; bounded by pool capacity. */
   sessionIdleMs?: number;
   /** Regenerate rejected decisions inside one request; never retry runtime/permission/budget failures. */

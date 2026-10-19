@@ -47,7 +47,8 @@ export class Telemetry {
     const row = this.tokens();
     row[kind]++; row.chars += text.length; row.maxDeltaChars = Math.max(row.maxDeltaChars, text.length);
   }
-  observe(message: SDKMessage, output: (text: string) => void = () => {}, thinking: (text: string) => void = () => {}) {
+  observe(message: SDKMessage, output: (text: string) => void = () => {}, thinking: (text: string) => void = () => {},
+    status: (text: string) => void = () => {}) {
     this.session_id = message.session_id ?? this.session_id;
     if (message.type === 'system' && message.subtype === 'init') {
       this.cli_version = message.qodercli_version;
@@ -58,6 +59,10 @@ export class Telemetry {
       this.apiRetryDetails.push({ attempt: message.attempt, max_retries: message.max_retries,
         retry_delay_ms: message.retry_delay_ms, error_status: message.error_status, error: apiErrorCode(message.error) });
       if (this.apiRetryDetails.length > 16) this.apiRetryDetails.shift();
+      // Upstream backoff produces no model deltas; surface it so a client idle watchdog sees progress.
+      status(`[QoderBridge] Qoder upstream retry ${message.attempt}/${message.max_retries}` +
+        `${typeof message.error_status === 'number' ? ` (HTTP ${message.error_status})` : ''}; ` +
+        `next attempt in ${Math.max(0, Math.round(message.retry_delay_ms / 1000))}s.`);
     }
     if (message.type === 'system' && message.subtype === 'model_queue_status') {
       this.modelQueueStatuses.push({ status: message.status, queue_count: message.queue_count ?? null,
@@ -142,6 +147,10 @@ export class Telemetry {
       typeof row.credits === 'number' && Number.isFinite(row.credits) && row.credits >= 0)
       ? streamCreditRows.reduce((total, row) => total + (row.credits as number), 0) : null;
     const assistantCredits = sum('credits');
+    // Per-response list-price Credits; promotions only change `credits`, so billing inversion prefers these.
+    const streamOriginalCredits = streamCreditRows.length && streamCreditRows.every(row =>
+      typeof row.original_credits === 'number' && Number.isFinite(row.original_credits) && row.original_credits >= 0)
+      ? streamCreditRows.reduce((total, row) => total + (row.original_credits as number), 0) : null;
     return {
       request_id: this.request_id, session_id: this.session_id, cli_version: this.cli_version,
       model: this.policyCalls[0]?.model ?? null,
@@ -177,6 +186,9 @@ export class Telemetry {
       text_delta_count: this.textDeltaCount, thinking_delta_count: this.thinkingDeltaCount,
       thinking_chars: this.thinkingChars, last_delta_ms: this.lastDeltaMs,
       original_credits: sum('original_credits'), total_session_credits: this.result?.total_credits ?? null,
+      stream_original_credits: streamOriginalCredits,
+      stream_billable: streamCreditRows.some(row => row.billable === false) ? false
+        : streamCreditRows.some(row => row.billable === true) ? true : null,
       billable: rows.map(r => r.billable), requests: rows,
       result: this.result?.subtype ?? 'incomplete', terminal_reason: this.result?.terminal_reason ?? null,
       stream_stop_reasons: [...this.streamStopReasons],

@@ -10,10 +10,15 @@ import { hasConversationPrefix, routeConversation } from './routing.js';
 import { abortable } from './async.js';
 import { prefixCacheEstimate, withCachedTokens, ZERO_USAGE, type OpenAIUsage } from './usage.js';
 import {recoverDecision,decisionRetryLimit,decisionCorrectionPrompt,type RecoveryTrace} from './decision-recovery.js';
+import { cacheFromCredits, sharedTierCalendar } from './billing.js';
 
 export type InferHooks = { signal?: AbortSignal; onText?: (text: string) => void;
   onThinking?: (text: string) => void; validateDecision?: (decision: Decision) => void;
-  prepareDecisionRetry?: () => boolean };
+  prepareDecisionRetry?: () => boolean;
+  /** Bridge status during upstream silence (SDK API retries); not model output. */
+  onStatus?: (text: string) => void;
+  /** Client-picked effort the model offers; overrides the configured default for this request. */
+  reasoningEffort?: string };
 
 type Warm = Awaited<ReturnType<typeof startup>>;
 type RecordSession = {
@@ -27,7 +32,12 @@ type RecordSession = {
   lastPromptTokens: number | null;
   lastFailedDecision: {hash:string;response:string;error:string;recovery:RecoveryTrace} | null;
   lastCompletionId: string | null;
+  /** Read by resolveModel before each upstream call; set only for a single bridge-initiated retry. */
+  policy: { reasoning: string | null };
 };
+/** Bridge-initiated retries (format corrections, reasoning-guard retries) step down from max effort. */
+const RETRY_REASONING = 'high';
+export const DEFAULT_REASONING_GUARD_TOKENS = 24_000;
 const MAX_SESSIONS = 8;
 const IDLE_MS = 60 * 60_000;
 const SWEEP_MS = 60_000;
@@ -40,6 +50,7 @@ export class QoderPool {
   private prewarmError: string | null = null;
   private recoveredRequests = 0;
   private exhaustedRequests = 0;
+  private reasoningGuardTrips = 0;
   // Idle SDK runtimes are otherwise released only when another session is opened.
   private sweeper = setInterval(() => this.sweepIdle(), SWEEP_MS);
   constructor(readonly config: Config) {
@@ -49,6 +60,11 @@ export class QoderPool {
     if (config.sessionIdleMs !== undefined && (!Number.isSafeInteger(config.sessionIdleMs) || config.sessionIdleMs < 60_000)) {
       clearInterval(this.sweeper);
       throw new Error('sessionIdleMs must be an integer >=60000');
+    }
+    const guard = config.reasoningGuardTokens;
+    if (guard !== undefined && (!Number.isSafeInteger(guard) || (guard !== 0 && guard < 1024))) {
+      clearInterval(this.sweeper);
+      throw new Error('reasoningGuardTokens must be 0 (disabled) or an integer >=1024');
     }
   }
   private primeNext(): Promise<RecordSession> {
@@ -69,10 +85,12 @@ export class QoderPool {
     const queue = new InputQueue<SDKUserMessage>();
     let warm: Warm | undefined;
     const policyCalls: RecordSession['policyCalls'] = [];
+    const policy: RecordSession['policy'] = { reasoning: null };
     try {
       const options = baseOptions(this.config, controller);
       options.resolveModel = context => {
-        const selected = selectModel(context.availableModels, this.config);
+        const selected = selectModel(context.availableModels,
+          policy.reasoning ? { ...this.config, reasoning: policy.reasoning } : this.config);
         policyCalls.push({ purpose: context.purpose, model: selected.model,
           context_window: selected.parameters?.contextWindow ?? null,
           reasoning_effort: selected.parameters?.reasoningEffort ?? null });
@@ -88,7 +106,7 @@ export class QoderPool {
         touched: Date.now(), locked: Promise.resolve(), lastCredits: null, model: selected.model, busy: 0,
         toolSignature: null, retryHint: null, retryMessageHash: null, policyCalls,
         closed: false, lastSuccessHash: null, lastDecision: null, sdkSessionId: null, lastPromptTokens: null,
-        lastFailedDecision:null,lastCompletionId:null };
+        lastFailedDecision:null,lastCompletionId:null, policy };
     } catch (error) { queue.close(); warm?.close(); controller.abort(); throw error; }
   }
   private close(record: RecordSession) {
@@ -146,7 +164,10 @@ export class QoderPool {
   stats() { return { sessions: this.sessions.size, busy: [...this.sessions.values()].filter(row => row.busy > 0).length,
     opening: this.openingByClient.size, prewarmed: this.nextWarm !== null, prewarm_error: this.prewarmError,
     decision_recovery:{max_correction_calls:decisionRetryLimit(this.config.decisionRetries),
-      recovered_requests:this.recoveredRequests,exhausted_requests:this.exhaustedRequests} }; }
+      recovered_requests:this.recoveredRequests,exhausted_requests:this.exhaustedRequests},
+    reasoning_guard:{max_reasoning_tokens:this.guardTokens(),trips:this.reasoningGuardTrips},
+    billing_calendar_overrides:sharedTierCalendar.learnedDates() }; }
+  private guardTokens() { return this.config.reasoningGuardTokens ?? DEFAULT_REASONING_GUARD_TOKENS; }
   async infer(request: ChatRequest, hooks: InferHooks = {}) {
     const start = performance.now();
     const signal = AbortSignal.any([AbortSignal.timeout(this.config.timeout), ...(hooks.signal ? [hooks.signal] : [])]);
@@ -165,7 +186,7 @@ export class QoderPool {
       const requestHash = createHash('sha256').update(JSON.stringify({ model: request.model,
         messages: request.messages, tools: request.tools, choice: request.tool_choice,
         temperature: request.temperature, max_tokens: request.max_tokens,
-        max_completion_tokens: request.max_completion_tokens })).digest('hex');
+        max_completion_tokens: request.max_completion_tokens, reasoning: hooks.reasoningEffort ?? null })).digest('hex');
       // An exhausted identical request must not restart another paid retry loop
       // just because an HTTP client retries the same body. A changed request
       // (including an explicit new user message) can start a new decision.
@@ -218,39 +239,75 @@ export class QoderPool {
         invoke:async(attemptPrompt,attempt,correctionSchemaCharacters)=>{
           const telemetry = new Telemetry();
           const policyStart = record.policyCalls.length;
+          const attemptAt = new Date();
           let inferenceError: string | null = null;
+          const guard = this.guardTokens();
+          let guardTripped = false;
+          // Corrections and guard retries need a valid next step, not another maximal deliberation.
+          const chosen = hooks.reasoningEffort ?? this.config.reasoning;
+          const reasoning = attempt > 0 && chosen === 'max' ? RETRY_REASONING : hooks.reasoningEffort ?? null;
+          const policy = record.policy ??= { reasoning: null };
+          policy.reasoning = reasoning;
+          const onThinking = (text: string) => {
+            hooks.onThinking?.(text);
+            // Long reasoning with no output is the max_tokens/error_max_turns failure mode; stop it early.
+            if (guard && !guardTripped && telemetry.textDeltaCount === 0 && telemetry.thinkingDeltaCount >= guard) {
+              guardTripped = true; this.reasoningGuardTrips++;
+              void record.q.interrupt().catch(() => {});
+            }
+          };
           try {
             signal.throwIfAborted();
             record.queue.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: attemptPrompt } });
             while (true) {
               const step = await abortable(record.q.next(), signal);
               if (step.done) throw new Error('Qoder stream closed');
-              telemetry.observe(step.value, hooks.onText, hooks.onThinking);
+              telemetry.observe(step.value, hooks.onText, onThinking, hooks.onStatus);
               if (step.value.type === 'result') break;
             }
-            if (telemetry.result?.subtype !== 'success' || telemetry.result.is_error)
-              throw new Error(`Qoder result: ${telemetry.result?.subtype ?? 'missing'}`);
+            const failed = telemetry.result?.subtype !== 'success' || telemetry.result.is_error;
+            // An interrupted runaway turn leaves the SDK session usable; the recovery loop owns the retry.
+            if (failed && !guardTripped) throw new Error(`Qoder result: ${telemetry.result?.subtype ?? 'missing'}`);
           } catch (error) {
             inferenceError = safeError(error);
             this.close(record);
-          }
+          } finally { policy.reasoning = null; }
+          const reasoningGuardStopped = guardTripped && !inferenceError &&
+            (telemetry.result?.subtype !== 'success' || telemetry.result.is_error);
           record.touched = Date.now();
           const turnPolicies = record.policyCalls.slice(policyStart);
           const windows = new Set(turnPolicies.map(call => call.context_window));
           const report = telemetry.snapshot(windows.size === 1 ? [...windows][0]! : null);
           const measured = report.normalized_usage_source === 'qoder_context_ratio+stream_token_deltas' ? report.normalized_usage : null;
-          const cacheEstimate = measured ? prefixCacheEstimate(measured.prompt_tokens, record.lastPromptTokens) : null;
-          const clientUsage = measured && cacheEstimate !== null && this.config.cacheUsage === 'estimate'
-            ? withCachedTokens(measured, cacheEstimate) : report.normalized_usage;
-          // The Qoder session appends every completed request, including one whose decision is later rejected.
-          if (!inferenceError) record.lastPromptTokens = report.normalized_usage?.prompt_tokens ?? null;
+          const previousPrompt = record.lastPromptTokens;
+          const cacheEstimate = measured ? prefixCacheEstimate(measured.prompt_tokens, previousPrompt) : null;
           record.sdkSessionId = report.session_id ?? record.sdkSessionId;
-          const deltaCredits = report.total_session_credits === null ? report.credits :
-            report.total_session_credits - (record.lastCredits ?? 0);
-          if (report.total_session_credits !== null) record.lastCredits = report.total_session_credits;
-          else if (report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
+          // A cumulative total below the last one (seen after interrupted turns) cannot be differenced.
+          const total = report.total_session_credits;
+          const regressed = total !== null && record.lastCredits !== null && total < record.lastCredits;
+          const deltaCredits = regressed ? null : total === null ? report.credits : total - (record.lastCredits ?? 0);
+          if (total !== null && !regressed) record.lastCredits = total;
+          else if (total === null && report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
+          const billedCredits = report.stream_original_credits ?? deltaCredits;
+          const billing = measured && typeof billedCredits === 'number' && report.stream_billable !== false
+            ? cacheFromCredits({ model: record.model, promptTokens: measured.prompt_tokens,
+              outputTokens: measured.completion_tokens, credits: billedCredits, at: attemptAt, prefixHint: previousPrompt }) : null;
+          const cacheMode = this.config.cacheUsage ?? 'none';
+          const clientCached = cacheMode === 'billing' ? billing?.cachedTokens ?? cacheEstimate
+            : cacheMode === 'estimate' ? cacheEstimate : null;
+          const clientUsage = measured && clientCached !== null ? withCachedTokens(measured, clientCached) : report.normalized_usage;
+          // The Qoder session appends every completed request, including one whose decision is later rejected.
+          if (!inferenceError && measured) record.lastPromptTokens = measured.prompt_tokens;
+          else if (!inferenceError && !reasoningGuardStopped) record.lastPromptTokens = report.normalized_usage?.prompt_tokens ?? null;
           const attemptReport={...report,response:telemetry.text,error:inferenceError,
-            stage:signal.aborted?'cancelled_or_timeout':'inference',model:record.model,reused_session:attempt>0||reused,
+            stage:signal.aborted?'cancelled_or_timeout':reasoningGuardStopped?'reasoning_guard':'inference',
+            requested_reasoning:reasoning??this.config.reasoning??null,
+            reasoning_guard:guardTripped?{limit:guard,reasoning_tokens:telemetry.thinkingDeltaCount,stopped:reasoningGuardStopped}:null,
+            reasoning_guard_stopped:reasoningGuardStopped,
+            streamed_output_tokens:telemetry.textDeltaCount+telemetry.thinkingDeltaCount,
+            streamed_reasoning_tokens:telemetry.thinkingDeltaCount,
+            cache_billing:billing,billing_tier:billing?.tier??null,
+            model:record.model,reused_session:attempt>0||reused,
             startup_ms:attempt>0||reused?0:performance.now()-start-report.wall_ms,
             prompt_chars:attemptPrompt.length,available_tool_definition_chars:toolSignature.length,
             sent_tool_definition_chars:attempt>0?correctionSchemaCharacters:omitUnchangedTools?0:JSON.stringify(toolDefinitions(request)).length,
@@ -262,14 +319,16 @@ export class QoderPool {
             credits_delta:deltaCredits,credits_delta_source:report.total_session_credits!==null?'cumulative_delta':report.request_credits_source,
             local_response_replay:false,client_usage:clientUsage,cache_estimate_tokens:cacheEstimate,
             cache_estimate_ratio:cacheEstimate!==null&&measured&&measured.prompt_tokens>0?cacheEstimate/measured.prompt_tokens:null,
-            client_cache_usage:clientUsage?.prompt_tokens_details?(measured?'session_prefix_estimate':'reported'):'omitted'};
+            client_cache_usage:!clientUsage?.prompt_tokens_details?'omitted':!measured?'reported'
+              :cacheMode==='billing'&&billing?'credits_inverse':'session_prefix_estimate'};
           attemptReports.push(attemptReport);
           return attemptReport;
       }});
       const {decision,decisionError,recovery}=recovered;
       const turn=recovered.turn;
       if(recovery.outcome==='recovered')this.recoveredRequests++;
-      if(['exhausted','repeated_invalid_decision'].includes(recovery.outcome)){
+      // An identical HTTP retry of these outcomes would repeat the same paid loop; a changed request may continue.
+      if(['exhausted','repeated_invalid_decision','reasoning_budget'].includes(recovery.outcome)){
         this.exhaustedRequests++;
         record.lastFailedDecision={hash:requestHash,response:turn.response,error:decisionError!,recovery};
       }

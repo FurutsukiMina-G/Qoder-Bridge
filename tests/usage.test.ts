@@ -85,3 +85,10 @@ test('session-prefix cache estimate is floored to DeepSeek cache units and bound
   assert.deepEqual(withCachedTokens({ prompt_tokens: 513, completion_tokens: 1, total_tokens: 514 }, 192)
     .prompt_tokens_details, { cached_tokens: 192 });
 });
+test('SDK API retries surface as bridge status so a silent upstream still shows progress', () => {
+  const t = new Telemetry(); const statuses: string[] = [];
+  t.observe({ type: 'system', subtype: 'api_retry', attempt: 2, max_retries: 10, retry_delay_ms: 4200, error_status: 503,
+    error: 'server_error' } as unknown as SDKMessage, undefined, undefined, text => statuses.push(text));
+  assert.deepEqual(statuses, ['[QoderBridge] Qoder upstream retry 2/10 (HTTP 503); next attempt in 4s.']);
+  assert.equal(t.snapshot().api_retries, 1);
+});

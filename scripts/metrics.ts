@@ -25,6 +25,10 @@ const hit = cacheKnown.reduce((n, row) => n + (row.telemetry.usage.prompt_tokens
 const prompt = cacheKnown.reduce((n, row) => n + row.telemetry.usage.prompt_tokens, 0);
 const estimated = reported.filter(row => typeof row.telemetry?.cache_estimate_tokens === 'number');
 const estimatedPrompt = estimated.reduce((n, row) => n + row.telemetry.usage.prompt_tokens, 0);
+// Billing-derived cache split covers the final attempt; compare against that attempt's prompt.
+const billed = attempts.filter(row => row.telemetry?.cache_billing);
+const billedPrompt = billed.reduce((n, row) => n + row.telemetry.cache_billing.cached_tokens + row.telemetry.cache_billing.uncached_tokens, 0);
+const peakCredits = rows.filter(row => row.telemetry?.billing_tier === 'peak').reduce((n, row) => n + knownRequestCredits(row), 0);
 console.log(JSON.stringify({ scope: hash ?? `latest ${limit} Bridge requests`,
   since: rows[0]?.time ?? null, until: rows.at(-1)?.time ?? null,
   requests: rows.length, modelAttempts:accounting.upstreamModelRequestCountUnknown?null:accounting.upstreamModelRequestsKnown,
@@ -45,7 +49,13 @@ console.log(JSON.stringify({ scope: hash ?? `latest ${limit} Bridge requests`,
   cacheHitRatio: cacheKnown.length === attempts.length && prompt > 0 ? hit / prompt : null,
   sessionPrefixCacheEstimate: estimatedPrompt > 0
     ? estimated.reduce((n, row) => n + row.telemetry.cache_estimate_tokens, 0) / estimatedPrompt : null,
+  billingDerivedCache: { requests: billed.length, cacheHitRatio: billedPrompt > 0
+    ? billed.reduce((n, row) => n + row.telemetry.cache_billing.cached_tokens, 0) / billedPrompt : null,
+    uncachedPromptTokens: billed.reduce((n, row) => n + row.telemetry.cache_billing.uncached_tokens, 0) },
+  peakTierCredits: Number(peakCredits.toFixed(6)),
+  reasoningGuardStops: rows.reduce((n, row) => n + (row.telemetry?.reasoning_guard_stops ?? 0), 0),
   note: 'Tokens: Qoder context_usage_ratio x policy window (prompt) and streamed token deltas (output, reasoning ' +
-    'included). Qoder reports no cache counts, so the prefix figure is an estimate; local replay is not a provider ' +
-    'cache hit. Credits are recorded consumption. Unavailable data stays null.',
+    'included). Qoder reports no cache counts: billingDerivedCache solves each bill against the published DeepSeek ' +
+    'tariff (an inference), the prefix figure is an estimate, and local replay is not a provider cache hit. Peak tier ' +
+    '(Beijing weekdays 9-12, 14-18) costs twice off-peak. Credits are recorded consumption. Unavailable data stays null.',
 }, null, 2));

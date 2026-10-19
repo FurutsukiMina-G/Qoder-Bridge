@@ -167,3 +167,18 @@ test('a diverged history for the same client key closes the unreachable Qoder se
   assert.equal(pool.stats().sessions, 1);
   pool.closeAll();
 });
+test('billing mode sends the cache split solved from each request bill, with its tier', async () => {
+  const { pool } = streamingPool('billing', [0.00923, 0.009415]);
+  try {
+    for (const turn of [await pool.infer(request), await pool.infer(next('Again'))]) {
+      const report = turn.report as Record<string, unknown>;
+      const billing = report.cache_billing as { cachedTokens: number; tier: string } | null;
+      const usage = report.client_usage as { prompt_tokens: number; prompt_tokens_details?: { cached_tokens: number } };
+      assert.ok(billing, 'the fixture bill is explainable by the tariff');
+      assert.equal(report.client_cache_usage, 'credits_inverse');
+      assert.equal(usage.prompt_tokens_details?.cached_tokens, billing!.cachedTokens);
+      assert.ok(billing!.cachedTokens >= 0 && billing!.cachedTokens <= usage.prompt_tokens);
+      assert.ok(['peak', 'off_peak'].includes(report.billing_tier as string));
+    }
+  } finally { pool.closeAll(); }
+});

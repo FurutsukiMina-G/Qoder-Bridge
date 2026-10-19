@@ -5,16 +5,16 @@
 | 项目 | 值 |
 |---|---|
 | Provider | `qoderbridge` |
-| Flash | `qoder-deepseek-flash` → Qoder CN `dfmodel` |
-| Pro | `qoder-deepseek-pro` → Qoder CN `dmodel`（DeepSeek-V4-Pro） |
+| Flash | `qoder-deepseek-flash`（1M）、`-400k`、`-200k` → Qoder CN `dfmodel`；推理 low/high/max |
+| Pro | `qoder-deepseek-pro`（1M）、`-400k`、`-200k` → Qoder CN `dmodel`（DeepSeek-V4-Pro）；推理 high/max |
 | API | `openai-completions` |
 | Base URL | `http://127.0.0.1:8646/v1` |
 | 凭据引用 | `QODERBRIDGE_LOCAL_KEY`；随机密钥位于本项目 `.runtime/bridge-key`，由 Harness 凭据服务保存副本 |
 | 输入类型 | text |
-| 上下文 | Harness 1M；Bridge 每次请求向 Qoder 指定 1M/max |
+| 上下文与推理 | 由所选模型决定窗口（1M/400K/200K），Harness 与 Qoder 使用同一窗口；推理等级随请求的 `reasoning_effort` 生效，默认 max |
 | 工作模式 | Qoder SDK 返回 JSON 决策 → Bridge 校验并转换为 `tool_calls` → Harness 执行原生工具 |
 
-Harness 当前模型目录中已出现该 Provider 的两个模型，可选择 `Qoder DeepSeek Flash` 或 `Qoder DeepSeek V4 Pro`。注册脚本只补充缺少的模型，保留已有模型设置，不批量改写会话选择。当前默认选择可用 `npm.cmd run status` 查看。Provider 和凭据通过 Harness 自带的 Settings/Remote API 写入，修改前的非敏感配置快照保存在 `reports/dsh-settings-before.json`。桥接密钥不进入源码、日志或这个文档。
+Harness 模型目录中该 Provider 提供 6 个模型（Flash/Pro × 1M/400K/200K），模型选择处可同时切换推理等级。注册脚本 `scripts/configure-dsh.ts` 刷新 Bridge 自己的模型条目、打开 `supportsReasoningEffort` 并设默认等级 max，保留用户另外添加的条目，不批量改写会话选择。当前默认选择可用 `npm.cmd run status` 查看。Provider 和凭据通过 Harness 自带的 Settings/Remote API 写入，修改前的配置快照保存在本机 `reports/dsh-settings-before-<日期>.json`。桥接密钥不进入源码、日志或这个文档。调节方法与取舍见 [计费反推缓存、推理守卫与 Harness 内调节](billing-and-reasoning.md#在-harness-中调节推理等级与上下文窗口)。
 
 两种模型共用 8646 API，分别持有 Qoder 会话池、工具目录缓存、Credits 差分和本地重放状态；同一 Harness 会话切换模型不会误用另一模型的历史。Pro 不可用时明确报错，不静默替换成 Flash。启动默认只预热 Flash，Pro 第一次使用按需初始化；两者合计最多 3 个活动请求。完整验收见 [Opus 改动复核与 Pro](opus-review-and-pro.md)。
 

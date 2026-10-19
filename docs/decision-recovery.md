@@ -27,7 +27,8 @@ Bridge 默认在**同一个 HTTP 请求、同一个 Qoder 会话、同一把会�
 - `reports/tasks.ndjson` 只保留摘要、次数、失败原因与响应哈希，不再复制完整坏输出。历史原始报告保持可读。
 - 一次 HTTP 请求可包含多次模型调用。`model_requests` 与 Bridge 请求数分别记录；旧日志缺少上游调用计数时标为未知，不把每个历史 HTTP 请求猜成精确的一次调用。
 - Credits 和可用的 token 用量包含所有尝试。任何尝试用量未知时，总量仍未知，同时单列已知 Credits 小计，避免当成零或重复相加。token/缓存的既有来源标记保持，推导值不会变成上游精确计量。聚合请求不使用最后一次的解码速率冒充整轮速率。
-- 多次尝试时 `usage` 是累计消耗；实际最后一次上下文占用看 `context_usage_ratio` 和逐次证据。若 Host 只用累计输入推断上下文压力，可能更早触发压缩，不能把这个累计输入称为最后一次上下文的长度。
+- 多次尝试时，日志的 `normalized_usage` 是全部尝试的累计消耗；发给 Harness 的 usage 是**最后一次尝试的输入 + 全部尝试的输出**。Harness 把最近一次调用的 usage 当作当前上下文长度，累计输入会让它误以为上下文翻倍而提前压缩。
+- 推理守卫中断的尝试（`stage=reasoning_guard`）同样占用纠正次数，重试从 `max` 降为 `high`；全部耗尽返回 `qoder_reasoning_budget` 并断路相同请求。见[推理守卫](billing-and-reasoning.md#推理守卫)。
 - 工具 schema 按内容缓存并限制容量；独立客户端的 `$id` 命名空间分离，避免跨任务校验污染和每个 HTTP schema 副本无限滞留。
 
 只读检查可用 `Invoke-RestMethod http://127.0.0.1:8646/health` 和 `npm.cmd run metrics -- --session <原会话ID> --limit 10000`。`knownCredits` 包含有部分未知尝试时仍可确认的小计；同时查看 `unknownCreditRequests`。失败断路后应检查错误与原始证据，不用重启服务或反复提交同一请求来清空限额。

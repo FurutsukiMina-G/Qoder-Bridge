@@ -5,18 +5,20 @@ import { join, resolve } from 'node:path';
 import { ChatRequest, parseDecision, conversationPrompt, completion, assertTextRequest } from './compat.js';
 import { runProbe, type Config } from './client.js';
 import { appendReport, safeError } from './telemetry.js';
-import { QoderPool } from './pool.js';
+import { QoderPool, DEFAULT_REASONING_GUARD_TOKENS } from './pool.js';
 import { taskLogEntry } from './task-log.js';
 import { RequestSlots } from './async.js';
 import { FinalTextProjector } from './streaming.js';
 import type { OpenAIUsage } from './usage.js';
-import { BRIDGE_MODELS, DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL, bridgeModel } from './model.js';
+import { BRIDGE_MODELS, DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL, bridgeModel, requestedEffort } from './model.js';
 import {recoverDecision,recoverySummary,decisionRetryLimit,type RecoveryTrace} from './decision-recovery.js';
 import {assertToolContract} from './tool-contract.js';
 
 export const PUBLIC_MODEL = DEFAULT_PUBLIC_MODEL;
 export const PUBLIC_PRO_MODEL = PRO_PUBLIC_MODEL;
 const BODY_LIMIT = 12 * 1024 * 1024;
+/** Report upstream silence well inside a 300 s client stream-idle watchdog. */
+const SILENCE_STATUS_MS = 60_000;
 function send(res: ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(value));
@@ -54,7 +56,8 @@ export async function createBridgeServer(config: Config, options: {
   const requestConfig = (model: string): Config => {
     const spec = bridgeModel(model);
     if (!spec) throw new Error(`Unknown model: ${model}`);
-    return { ...config, model: spec.runtimeId };
+    // Each public variant pins its Qoder context window; the Harness entry declares the same window.
+    return { ...config, model: spec.runtimeId, context: spec.contextWindow };
   };
   const poolFor = (model: string) => {
     if (options.infer) return null;
@@ -84,10 +87,17 @@ export async function createBridgeServer(config: Config, options: {
     res.once('close', disconnect);
     const streamBase = { id: `chatcmpl-${bridgeRequestId}`, object: 'chat.completion.chunk',
       created: Math.floor(startedAt / 1000), model: PUBLIC_MODEL as string };
+    let lastEmitAt = Date.now();
     const emit = (delta: Record<string, unknown>, finish: string | null = null) => {
       if (res.destroyed) throw new Error('Harness client disconnected');
-      streamChunks++;
+      streamChunks++; lastEmitAt = Date.now();
       res.write(`data: ${JSON.stringify({ ...streamBase, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
+    };
+    // Client idle watchdogs count parsed deltas, not SSE comments. Before any answer text, report upstream
+    // waits in the reasoning channel; this is bridge status, never model output.
+    const status = (text: string) => {
+      if (firstClientTextMs !== null || res.destroyed) return;
+      try { emit({ reasoning_content: `\n${text}\n` }); } catch { /* the close handler aborts the request */ }
     };
     const projector = new FinalTextProjector(text => {
       firstClientTextMs ??= Date.now() - startedAt;
@@ -105,25 +115,32 @@ export async function createBridgeServer(config: Config, options: {
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, {
         status: 'ok', pid: process.pid, model: PUBLIC_MODEL, port: bridgePort,
         models: BRIDGE_MODELS.map(model => model.id),
+        modelOptions: BRIDGE_MODELS.map(({ id, contextWindow, efforts }) => ({ id, contextWindow, reasoningEfforts: efforts })),
         activeRequests: slots.active, queuedRequests: slots.queued, pool: pool?.stats() ?? null,
         pools: Object.fromEntries([...pools].map(([model, value]) => [model, value.stats()])),
         capabilities: { finalTextStreaming: true, thinkingStreaming: true, validatedTools: true,
           decisionRecovery: {maxCorrectionCalls:decisionRetryLimit(config.decisionRetries),
             beforeToolDispatch:true,retriesRuntimeFailures:false},
           usage: 'qoder-context-ratio+stream-token-deltas',
-          cacheUsage: config.cacheUsage === 'estimate' ? 'session-prefix-estimate' : 'not-reported' },
+          cacheUsage: config.cacheUsage === 'billing' ? 'qoder-credits-inverse+session-prefix-fallback'
+            : config.cacheUsage === 'estimate' ? 'session-prefix-estimate' : 'not-reported',
+          reasoningGuard: { maxReasoningTokensBeforeOutput: config.reasoningGuardTokens ?? DEFAULT_REASONING_GUARD_TOKENS,
+            retryReasoningEffort: config.reasoning === 'max' ? 'high' : config.reasoning ?? null } },
       });
       if (req.headers.authorization !== `Bearer ${key}`) return send(res, 401, { error: { message: 'Unauthorized', type: 'authentication_error' } });
       if (req.method === 'GET' && url.pathname === '/v1/models') return send(res, 200, {
         object: 'list', data: BRIDGE_MODELS.map(model => ({ id: model.id, name: model.name,
-          object: 'model', created: 0, owned_by: 'qoderbridge' })),
+          object: 'model', created: 0, owned_by: 'qoderbridge', context_window: model.contextWindow,
+          reasoning_efforts: model.efforts })),
       });
       if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions')
         return send(res, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
       const raw = await body(req);
       const request = ChatRequest.parse(raw);
       taskRequest = request;
-      if (!bridgeModel(request.model)) throw new Error(`Unknown model: ${request.model}`);
+      const spec = bridgeModel(request.model);
+      if (!spec) throw new Error(`Unknown model: ${request.model}`);
+      const reasoningEffort = requestedEffort(spec, request.reasoning_effort);
       streamBase.model = request.model;
       assertTextRequest(request);
       assertToolContract(request);
@@ -134,14 +151,19 @@ export async function createBridgeServer(config: Config, options: {
           'cache-control': 'no-cache, no-transform', connection: 'keep-alive',
           'x-qoderbridge-stream-mode': 'final-text-and-thinking-tools-validated' });
         emit({ role: 'assistant' });
-        heartbeat = setInterval(() => { if (!res.destroyed) res.write(': waiting for Qoder\n\n'); }, 15000);
+        heartbeat = setInterval(() => {
+          if (res.destroyed) return;
+          res.write(': waiting for Qoder\n\n');
+          const silent = Date.now() - lastEmitAt;
+          if (silent >= SILENCE_STATUS_MS) status(`[QoderBridge] Still waiting for Qoder (${Math.round(silent / 1000)}s without upstream output).`);
+        }, 15000);
         heartbeat.unref();
       }
       const release = await slots.take(controller.signal);
       try {
         controller.signal.throwIfAborted();
         const selectedPool = poolFor(request.model);
-        const pooled = selectedPool ? await selectedPool.infer(request, { signal: controller.signal,
+        const pooled = selectedPool ? await selectedPool.infer(request, { signal: controller.signal, reasoningEffort,
           onText: request.stream ? text => projector.push(text) : undefined,
           onThinking: request.stream ? text => {
             firstClientThinkingMs ??= Date.now() - startedAt;
@@ -149,12 +171,13 @@ export async function createBridgeServer(config: Config, options: {
           } : undefined,
           validateDecision: request.stream ? decision => projector.validate(decision) : undefined,
           prepareDecisionRetry:request.stream?()=>projector.resetUncommitted():undefined,
+          onStatus: request.stream ? status : undefined,
         }) : null;
         const direct=pooled?null:await recoverDecision({request,prompt:conversationPrompt(request),
           retries:config.decisionRetries,signal:controller.signal,
           prepareRetry:request.stream?()=>projector.resetUncommitted():undefined,
           validateDecision:request.stream?decision=>projector.validate(decision):undefined,
-          invoke:async prompt=>infer(requestConfig(request.model),prompt,undefined,
+          invoke:async prompt=>infer({...requestConfig(request.model),...(reasoningEffort?{reasoning:reasoningEffort}:{})},prompt,undefined,
             request.stream?text=>projector.push(text):()=>{})});
         decisionRecovery=pooled?.recovery??direct?.recovery;
         const turn=pooled?pooled.report:{...direct!.turn,decision_recovery:direct!.recovery};
@@ -198,10 +221,12 @@ export async function createBridgeServer(config: Config, options: {
       const turnLimit = message.includes('Qoder result: error_max_turns');
       const invalidArguments = /^Arguments for [\w.-]+ violate its schema/.test(message);
       const exhausted=decisionRecovery&&['exhausted','repeated_invalid_decision'].includes(decisionRecovery.outcome);
+      const reasoningBudget=decisionRecovery?.outcome==='reasoning_budget';
       const error = { message: turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
-        : !requestAccepted?message.slice(0,300):invalidArguments ? message.slice(0, 300) : exhausted ? 'Model decision correction limit reached; no rejected tool call was dispatched. Review the request before continuing.' : 'QoderBridge could not complete the model request', type: requestAccepted?'upstream_error':'invalid_request_error',
+        : !requestAccepted?message.slice(0,300):invalidArguments ? message.slice(0, 300) : exhausted ? 'Model decision correction limit reached; no rejected tool call was dispatched. Review the request before continuing.'
+        : reasoningBudget ? 'Model reasoning exceeded the bridge budget on every attempt before any decision; nothing was dispatched.' : 'QoderBridge could not complete the model request', type: requestAccepted?'upstream_error':'invalid_request_error',
         code:!requestAccepted?'invalid_request_error':controller.signal.aborted ? 'request_cancelled_or_timeout' : turnLimit ? 'qoder_turn_limit'
-          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId,
+          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':reasoningBudget?'qoder_reasoning_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId,
         ...(decisionRecovery?{decision_recovery:recoverySummary(decisionRecovery)}:{}) };
       if (!res.headersSent) send(res, requestAccepted ? 502 : 400, { error });
       else if (!res.destroyed) { res.write(`data: ${JSON.stringify({ error })}\n\n`); res.end(); }

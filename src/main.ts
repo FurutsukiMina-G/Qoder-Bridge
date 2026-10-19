@@ -16,8 +16,9 @@ async function main() {
     json: { type: 'boolean', default: false }, log: { type: 'string', default: 'reports/telemetry.ndjson' },
     help: { type: 'boolean', short: 'h' },
     port: { type: 'string', default: '8646' },
-    'cache-usage': { type: 'string', default: process.env.QODERBRIDGE_CACHE_USAGE ?? 'none' },
+    'cache-usage': { type: 'string', default: process.env.QODERBRIDGE_CACHE_USAGE ?? 'billing' },
     'decision-retries': { type: 'string', default: '2' },
+    'reasoning-guard-tokens': { type: 'string', default: process.env.QODERBRIDGE_REASONING_GUARD_TOKENS ?? '24000' },
   } });
   const [command, ...args] = positionals;
   if (values.help || !command) {
@@ -31,8 +32,11 @@ Options: --auth auto|cli|pat --timeout MS --cli-path PATH --proxy URL
          --reasoning LEVEL --context TOKENS --system-file FILE --log FILE
          --session-settings FILE (explicit session-only settings JSON)
          --decision-retries 0|1|2 (serve; bounded model correction before tools are dispatched)
-         --cache-usage none|estimate (serve; env QODERBRIDGE_CACHE_USAGE). Qoder reports no
-           cache counts; estimate sends the session-prefix estimate as cached_tokens
+         --cache-usage billing|estimate|none (serve; env QODERBRIDGE_CACHE_USAGE; default billing).
+           Qoder reports no cache counts; billing derives cached_tokens from each request's billed
+           Credits (prefix estimate as fallback), estimate always sends the session-prefix estimate
+         --reasoning-guard-tokens N (serve; default 24000, 0 disables). Stop a turn whose reasoning
+           reaches N tokens before any output and retry it once at lower effort
 Uses QODERCN_PERSONAL_ACCESS_TOKEN when set, otherwise official CLI login.
 Gate tools are inert sentinels; no user file is read or command executed.
 Exit codes: 0 success; 1 runtime/auth/config failure; 2 interception gate failed.
@@ -42,7 +46,8 @@ Native tool-result replay runs after interception passes; history auditing remai
   if (!['models', 'probe', 'gate', 'action', 'serve'].includes(command)) throw new Error(`Unknown command: ${command}`);
   if (!['auto', 'cli', 'pat'].includes(values.auth!)) throw new Error('Invalid --auth');
   if (!['permission', 'hook', 'defer'].includes(values.strategy!)) throw new Error('Invalid --strategy');
-  if (!['none', 'estimate'].includes(values['cache-usage']!)) throw new Error('Invalid --cache-usage');
+  if (!['none', 'estimate', 'billing'].includes(values['cache-usage']!)) throw new Error('Invalid --cache-usage');
+  const reasoningGuardTokens = Number(values['reasoning-guard-tokens']);
   const timeout = Number(values.timeout);
   if (!Number.isSafeInteger(timeout) || timeout < 1000) throw new Error('--timeout must be an integer >=1000 ms');
   const context = values.context === undefined ? undefined : Number(values.context);
@@ -54,6 +59,7 @@ Native tool-result replay runs after interception passes; history auditing remai
     sessionSettings: values['session-settings'] ? JSON.stringify(JSON.parse(await readFile(values['session-settings'], 'utf8'))) : undefined,
     cacheUsage: values['cache-usage'] as Config['cacheUsage'],
     decisionRetries:Number(values['decision-retries']),
+    reasoningGuardTokens,
     system: values['system-file'] ? await readFile(values['system-file'], 'utf8') :
       'Follow the user request directly. The host owns planning and tool execution. Be concise.',
   };

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { ModelInfo } from '@qodercn-ai/qodercn-agent-sdk';
-import { bridgeModel, selectModel, PRO_PUBLIC_MODEL, DEFAULT_PUBLIC_MODEL } from '../src/model.js';
+import { bridgeModel, selectModel, PRO_PUBLIC_MODEL, DEFAULT_PUBLIC_MODEL, BRIDGE_MODELS } from '../src/model.js';
 import { createBridgeServer } from '../src/server.js';
 import type { Config, runProbe } from '../src/client.js';
 
@@ -37,7 +37,8 @@ test('one endpoint advertises both models and routes Pro JSON/SSE to dmodel with
   });
   try {
     const models = await fetch(`${root}/v1/models`, { headers }).then(response => response.json());
-    assert.deepEqual(models.data.map((model: { id: string }) => model.id), [DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL]);
+    assert.deepEqual(models.data.map((model: { id: string }) => model.id), BRIDGE_MODELS.map(model => model.id));
+    assert.deepEqual(models.data.slice(0, 2).map((model: { id: string }) => model.id), [DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL]);
     const pro = await send(PRO_PUBLIC_MODEL).then(response => response.json());
     assert.equal(pro.model, PRO_PUBLIC_MODEL);
     assert.equal(pro.choices[0].message.content, 'dmodel');
@@ -50,4 +51,31 @@ test('one endpoint advertises both models and routes Pro JSON/SSE to dmodel with
     assert.equal((await send('deepseek-pro-unknown')).status, 400);
     assert.deepEqual(selected, ['dmodel', 'dfmodel', 'dmodel']);
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+test('context variants pin their Qoder window and a client-picked effort applies only when the model offers it', async () => {
+  const seen: Array<{ model?: string; context?: number; reasoning?: string }> = [];
+  const fake = (async (config: Config) => {
+    seen.push({ model: config.model, context: config.context, reasoning: config.reasoning });
+    return { response: JSON.stringify({ kind: 'final', content: 'ok' }), error: null, stage: 'inference' };
+  }) as unknown as typeof runProbe;
+  await mkdir('.runtime', { recursive: true });
+  const server = await createBridgeServer({ auth: 'cli', timeout: 5000, strategy: 'permission', system: 'test', reasoning: 'max', context: 1_000_000 },
+    { port: 0, key: 'test', infer: fake, reportDir: await mkdtemp(resolve('.runtime/pro-tests-')) });
+  const root = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const send = (model: string, reasoning_effort?: string) => fetch(`${root}/v1/chat/completions`, { method: 'POST',
+    headers: { authorization: 'Bearer test', 'content-type': 'application/json' },
+    body: JSON.stringify({ model, reasoning_effort, messages: [{ role: 'user', content: 'fixture' }] }) });
+  try {
+    const listed = await fetch(`${root}/v1/models`, { headers: { authorization: 'Bearer test' } }).then(r => r.json());
+    const flash200k = listed.data.find((m: { id: string }) => m.id === 'qoder-deepseek-flash-200k');
+    assert.deepEqual([flash200k.context_window, flash200k.reasoning_efforts], [200_000, ['low', 'high', 'max']]);
+    assert.equal((await send('qoder-deepseek-flash-200k', 'low')).status, 200);
+    assert.equal((await send('qoder-deepseek-pro-400k', 'high')).status, 200);
+    assert.equal((await send('qoder-deepseek-pro', 'low')).status, 200);
+    assert.deepEqual(seen, [
+      { model: 'dfmodel', context: 200_000, reasoning: 'low' },
+      { model: 'dmodel', context: 400_000, reasoning: 'high' },
+      { model: 'dmodel', context: 1_000_000, reasoning: 'max' },
+    ]);
+  } finally { await new Promise<void>(done => server.close(() => done())); }
 });

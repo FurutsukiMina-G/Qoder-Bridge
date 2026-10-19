@@ -18,9 +18,14 @@ export type RecoveryTurn = {
   wall_ms?: number | null; api_ms?: number | null; sdk_wall_ms?: number | null;
   model_requests?: number | null; prompt_chars?: number; decision_repairs?: DecisionRepair[];
   cache_estimate_tokens?: number | null;
+  /** The bridge interrupted this attempt for reasoning past its budget before any output; nothing ran. */
+  reasoning_guard_stopped?: boolean;
+  /** Output deltas observed even when the attempt never reported a context ratio (e.g. interrupted). */
+  streamed_output_tokens?: number; streamed_reasoning_tokens?: number;
 };
 export type RecoveryOutcome = 'not_needed' | 'recovered' | 'exhausted' | 'repeated_invalid_decision' |
-  'upstream_failure' | 'output_budget' | 'empty_response' | 'cancelled' | 'already_streamed' | 'stream_conflict' | 'disabled';
+  'upstream_failure' | 'output_budget' | 'empty_response' | 'cancelled' | 'already_streamed' | 'stream_conflict' | 'disabled' |
+  'reasoning_budget';
 export type RecoveryTrace = {
   maxCorrectionCalls: number; correctionCalls: number; attempts: number; outcome: RecoveryOutcome;
   knownCreditsSubtotal: number; unknownCreditAttempts: number;
@@ -57,6 +62,36 @@ export function decisionCorrectionPrompt(request: ChatRequest, error: string, re
   return correction(request,error,response).prompt;
 }
 
+const REASONING_BUDGET_ERROR = 'Reasoning reached the bridge budget before any decision; the turn was stopped and nothing ran';
+const REASONING_BUDGET_PROMPT = 'BRIDGE NOTE. The previous attempt was stopped after very long reasoning, before it produced ' +
+  'any decision. Nothing was executed. Continue the SAME pending Harness task: decide only the immediate next step ' +
+  'with brief reasoning. If information is missing, request a small read or search instead of deliberating further. ' +
+  'Return exactly one JSON decision object in the required format, without markdown.\nAssistant decision:';
+
+/**
+ * Hosts read the latest call's usage as the current context size, so a multi-attempt request reports the final
+ * attempt's prompt (and its cache split) with all generated output. The summed accounting stays in normalized_usage.
+ */
+function contextUsage(turns: RecoveryTurn[]): OpenAIUsage | null {
+  const last = [...turns].reverse().map(t => t.client_usage ?? t.normalized_usage).find(Boolean);
+  if (!last) return null;
+  let completion = 0, reasoning = 0, reasoningKnown = true;
+  for (const t of turns) {
+    const usage = t.client_usage ?? t.normalized_usage;
+    if (usage) {
+      completion += usage.completion_tokens;
+      const value = usage.completion_tokens_details?.reasoning_tokens;
+      if (typeof value === 'number') reasoning += value; else reasoningKnown = false;
+    } else if (typeof t.streamed_output_tokens === 'number') {
+      completion += t.streamed_output_tokens;
+      if (typeof t.streamed_reasoning_tokens === 'number') reasoning += t.streamed_reasoning_tokens; else reasoningKnown = false;
+    } else return null;
+  }
+  return { prompt_tokens: last.prompt_tokens, completion_tokens: completion, total_tokens: last.prompt_tokens + completion,
+    ...(last.prompt_tokens_details ? { prompt_tokens_details: { ...last.prompt_tokens_details } } : {}),
+    ...(reasoningKnown ? { completion_tokens_details: { reasoning_tokens: reasoning } } : {}) };
+}
+
 /** Runtime/auth/quota/permission/cancellation/output budgets never enter the format correction loop. */
 function terminal<T extends RecoveryTurn>(turn: T, signal?: AbortSignal): RecoveryOutcome | null {
   if (signal?.aborted) return 'cancelled';
@@ -84,8 +119,11 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
     if (attempt>0) trace.correctionCalls++;
     let streamConflict=false;
     const repairs:DecisionRepair[]=[];
-    const blocked=terminal(turn,options.signal);
-    if (!blocked) {
+    // A guard-stopped attempt ended as an SDK error by design; it is retryable, not an upstream failure.
+    const stopped=turn.reasoning_guard_stopped===true&&!options.signal?.aborted;
+    const blocked=stopped?null:terminal(turn,options.signal);
+    if (stopped) {decision=null;decisionError=REASONING_BUDGET_ERROR;}
+    else if (!blocked) {
       try {decision=parseDecision(turn.response,options.request,r=>repairs.push(r));decisionError=null;}
       catch(error){decisionError=safeError(error);decision=null;}
       if (decision) try {options.validateDecision?.(decision);}
@@ -100,6 +138,11 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
       usageSource:turn.normalized_usage_source??'unavailable',modelRequests:turn.model_requests??null});
     if (decision) {trace.outcome=attempt?'recovered':'not_needed';break;}
     if (blocked) {trace.outcome=blocked;break;}
+    if (stopped) {
+      if (attempt>=limit) {trace.outcome='reasoning_budget';break;}
+      if (options.prepareRetry?.()===false) {trace.outcome='already_streamed';break;}
+      prompt=REASONING_BUDGET_PROMPT;correctionSchemaCharacters=0;continue;
+    }
     // A successful SDK retry may already have produced a valid response.
     // Accept that response above, but never add Bridge retries to an SDK API failure.
     if(turn.api_error_categories?.length){trace.outcome='upstream_failure';break;}
@@ -118,7 +161,7 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
   const sum=(field:keyof RecoveryTurn) => turns.every(t=>typeof t[field]==='number')
     ? turns.reduce((n,t)=>n+(t[field] as number),0):null;
   const usage=sumOpenAIUsage(turns.map(t=>t.normalized_usage));
-  const clientUsage=sumOpenAIUsage(turns.map(t=>t.client_usage??t.normalized_usage));
+  const clientUsage=contextUsage(turns);
   const usageSources=[...new Set(turns.map(t=>t.normalized_usage_source??'unavailable'))];
   const allUsageReported=usageSources.every(source=>['result','stream_events','assistant'].includes(source));
   const merged={...last,wall_ms:sum('wall_ms'),api_ms:sum('api_ms'),sdk_wall_ms:sum('sdk_wall_ms'),
@@ -133,6 +176,7 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
     cache_estimate_ratio:usage&&usage.prompt_tokens>0&&sum('cache_estimate_tokens')!==null?sum('cache_estimate_tokens')!/usage.prompt_tokens:null,
     cache_usage_status:usage?.prompt_tokens_details?'reported':'not_reported_by_qoder',
     cache_hit_ratio:usage?.prompt_tokens_details&&usage.prompt_tokens>0?usage.prompt_tokens_details.cached_tokens/usage.prompt_tokens:null,
+    reasoning_guard_stops:turns.filter(t=>t.reasoning_guard_stopped).length,
     decision_repairs:turns.flatMap(t=>t.decision_repairs??[])} as T;
   return {turn:merged,decision,decisionError,recovery:trace};
 }

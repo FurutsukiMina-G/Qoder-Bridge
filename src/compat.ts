@@ -16,6 +16,8 @@ export const ChatRequest = z.object({
   prompt_cache_key: z.string().min(1).optional(),
   max_tokens: z.number().int().positive().optional(), max_completion_tokens: z.number().int().positive().optional(),
   temperature: z.number().optional(), stream_options: z.unknown().optional(),
+  /** OpenAI-style level picked in the client; applied per request when the model offers it. */
+  reasoning_effort: z.string().optional(),
 }).passthrough();
 export type ChatRequest = z.infer<typeof ChatRequest>;
 const Decision = z.discriminatedUnion('kind', [

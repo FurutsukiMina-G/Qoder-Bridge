@@ -29,6 +29,10 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   api_retries?: number; api_retry_details?: unknown[]; api_error_categories?: string[]; model_queue_statuses?: unknown[];
   decision_recovery?: RecoveryTrace;
   model_requests?: number | null;
+  cache_billing?: { cachedTokens: number; uncachedTokens: number; tier: string; calendarTier: string;
+    residualTokens: number } | null;
+  billing_tier?: string | null; requested_reasoning?: string | null;
+  reasoning_guard?: { limit: number; reasoning_tokens: number; stopped: boolean } | null; reasoning_guard_stops?: number;
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -87,6 +91,12 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       api_error_categories: turn?.api_error_categories ?? [], model_queue_statuses: turn?.model_queue_statuses ?? [],
       cache_status: turn?.cache_usage_status ?? 'unavailable', cache_hit_ratio: turn?.cache_hit_ratio ?? null,
       cache_estimate_tokens: turn?.cache_estimate_tokens ?? null, cache_estimate_ratio: turn?.cache_estimate_ratio ?? null,
+      // Cache split solved from this request's billed Credits (final attempt); an inference, labelled as such.
+      cache_billing: turn?.cache_billing ? { cached_tokens: turn.cache_billing.cachedTokens,
+        uncached_tokens: turn.cache_billing.uncachedTokens, tier: turn.cache_billing.tier,
+        calendar_tier: turn.cache_billing.calendarTier, residual_tokens: turn.cache_billing.residualTokens } : null,
+      billing_tier: turn?.billing_tier ?? null, requested_reasoning: turn?.requested_reasoning ?? null,
+      reasoning_guard: turn?.reasoning_guard ?? null, reasoning_guard_stops: turn?.reasoning_guard_stops ?? 0,
       tool_definitions_reused: turn?.tool_definitions_reused ?? null },
     context_transport: { history_mode: turn?.history_mode ?? null, sent_message_count: turn?.sent_message_count ?? null },
   };

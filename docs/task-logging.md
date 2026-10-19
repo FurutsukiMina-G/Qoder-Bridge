@@ -11,8 +11,10 @@ Bridge 向 `reports/tasks.ndjson` 追加每次 Harness 请求的记录；`teleme
 - Qoder API/墙钟/首文本延迟、当前轮次 Credits 增量与 1M/max 模型策略记录。
 - `first_client_text_ms` / `first_client_thinking_ms` 与 SSE 块数，用于验证即时输出；文本块数不是 token 数。
 - `usage`、`usage_source`：计量得到的输入/输出/推理 token（`qoder_context_ratio+stream_token_deltas`），无法可靠计量时为空；`context_usage_ratio` 为原始比值，`output_tokens_per_second` 为 Bridge 观测的解码速度。
-- `client_usage`、`client_cache_usage`：实际发给 Harness 的 usage；只有开启 `--cache-usage estimate` 时才带缓存字段（`session_prefix_estimate`）。
+- `client_usage`、`client_cache_usage`：实际发给 Harness 的 usage 及其缓存来源：`credits_inverse`（默认，由账单反推）、`session_prefix_estimate`（前缀估算或反推失败时的回退）或 `omitted`。
+- `cache_billing`：最后一次尝试由 Credits 反推的命中/未命中 token、计费时段 `tier` 与日历时段 `calendar_tier`；`billing_tier` 便于按时段汇总。
 - `cache_status` 为 `not_reported_by_qoder` 时 `cache_hit_ratio` 为空；`cache_estimate_tokens` / `cache_estimate_ratio` 是会话前缀估算，始终记录，不是上游计量。
+- `requested_reasoning` 为实际请求的推理等级；`reasoning_guard` / `reasoning_guard_stops` 记录推理守卫的上限、中断时的推理 token 数和中断次数。
 
 系统与 developer 消息只记角色、长度和哈希，不记正文。Harness 会话键只存短哈希；Bridge 密钥、Qoder 凭据和认证头不会写入。摘录可能仍包含任务文本、文件内容或命令输出，所以日志保存在本机被 `.gitignore` 排除的 `reports/` 目录，不应直接公开。
 
