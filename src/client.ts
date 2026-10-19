@@ -6,6 +6,7 @@ import { selectModel, type Selection } from './model.js';
 import { InputQueue } from './queue.js';
 import { Interceptor, evaluateGate, type Strategy } from './interceptor.js';
 import { Telemetry, safeError } from './telemetry.js';
+import { sdkExceptionDetails, type SDKExceptionDetails } from './failures.js';
 import { auditHistory } from './history.js';
 
 export interface Config extends Selection {
@@ -89,6 +90,7 @@ export async function runProbe(config: Config, prompt: string, gatePath?: string
   let warm: Awaited<ReturnType<typeof startup>> | undefined;
   let q: Query | undefined;
   let error: string | undefined;
+  let sdkException: SDKExceptionDetails | null = null;
   let timedOut = false;
   let startupMs: number | null = null;
   let continuation: Record<string, unknown> | undefined;
@@ -174,7 +176,7 @@ export async function runProbe(config: Config, prompt: string, gatePath?: string
     if (!telemetry.result) error = 'Stream ended without terminal result';
     else if (telemetry.result.subtype !== 'success') error = telemetry.result.subtype;
     else if (telemetry.result.is_error) error = 'SDK returned is_error';
-  } catch (cause) { error = safeError(cause); }
+  } catch (cause) { error = safeError(cause); sdkException = sdkExceptionDetails(cause); }
   finally { clearTimeout(timer); queue.close(); warm?.close(); controller.abort(); }
   // Without an explicit policy window the ratio's denominator is unknown, so tokens stay unmeasured.
   const data = (telemetry ?? new Telemetry()).snapshot(selected?.parameters?.contextWindow ?? null);
@@ -189,7 +191,9 @@ export async function runProbe(config: Config, prompt: string, gatePath?: string
     expectedPath: gatePath!, requests: data.model_requests, policyCalls: data.policy_calls.length,
     retries: data.api_retries, completed: Boolean(telemetry?.result), credits: data.credits, timedOut, error,
   }) : undefined;
-  return { ...data, wall_ms: telemetry ? data.wall_ms : null,
+  return { ...data, sdk_exception: sdkException,
+    sdk_error_code: data.sdk_error_code ?? sdkException?.result_error_code ?? null,
+    wall_ms: telemetry ? data.wall_ms : null,
     mode: interceptor ? 'gate' : 'thin', timestamp: new Date().toISOString(),
     startup_ms: startupMs, total_wall_ms: performance.now() - coldStart,
     reasoning_effort: selected?.parameters?.reasoningEffort ?? null, context_window: selected?.parameters?.contextWindow ?? null,

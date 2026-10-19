@@ -10,7 +10,7 @@ import type {runProbe} from '../src/client.js';
 
 test('explicit SDK daily limit is actionable while unknown details never become public error text',()=>{
   const daily=publicUpstreamFailure(['You have reached the daily usage limit. Please try again later.'],['unknown']);
-  assert.equal(daily?.code,'upstream_daily_limit');assert.match(daily!.message,/No automatic retry/);
+  assert.equal(daily?.code,'upstream_daily_limit');assert.match(daily!.message,/每日用量上限/);
   assert.equal(publicUpstreamFailure(['unrecognized private payload Cookie=SECRET'],['unknown']),null);
   for(const [category,code]of [['billing_error','upstream_billing_error'],['authentication_failed','upstream_authentication_failed'],['rate_limit','upstream_rate_limit']]){
     const result=publicUpstreamFailure(['Bearer SECRET private payload'],[category!]);

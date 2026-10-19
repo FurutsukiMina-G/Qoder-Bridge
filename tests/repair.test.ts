@@ -918,7 +918,7 @@ test('Harness receives a useful bounded-correction/turn-limit error while invali
       const body = await response.json();
       assert.equal(body.error.code, turnLimit ? 'qoder_turn_limit' : 'model_decision_recovery_exhausted');
       assert.equal(body.error.decision_recovery.correctionCalls,turnLimit?0:1);
-      assert.match(body.error.message, turnLimit ? /per-request turn limit/ : /pattern/);
+      assert.match(body.error.message, turnLimit ? /per-request turn limit/ : /参数或决策格式/);
       assert.ok(body.error.request_id);
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   }

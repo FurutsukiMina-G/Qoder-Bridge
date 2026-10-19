@@ -3,6 +3,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { SDKMessage, SDKAssistantMessage, SDKResultMessage } from '@qodercn-ai/qodercn-agent-sdk';
 import { aggregateUsage, measuredUsage, reportedUsage, tokenDeltasReliable, type StreamTokens } from './usage.js';
+import { sdkErrorCode, sdkExceptionDetails, type SDKExceptionDetails } from './failures.js';
 const API_ERROR_CODES = new Set(['authentication_failed', 'billing_error', 'rate_limit', 'invalid_request',
   'server_error', 'unknown', 'max_output_tokens']);
 const apiErrorCode = (value: unknown) => typeof value === 'string' && API_ERROR_CODES.has(value) ? value : 'unknown';
@@ -15,6 +16,8 @@ export class Telemetry {
   policyCalls: Array<{ purpose: string; turn_index: number; model: string }> = [];
   assistants = new Map<string, SDKAssistantMessage>();
   result?: SDKResultMessage;
+  exception: SDKExceptionDetails | null = null;
+  captureException(error: unknown) { this.exception = sdkExceptionDetails(error); }
   text = '';
   streamed = false;
   textDeltaCount = 0;
@@ -160,6 +163,8 @@ export class Telemetry {
       result_token_usage: this.result?.usage ?? null,
       result_model_usage: this.result?.modelUsage ?? null,
       sdk_errors: this.result && 'errors' in this.result ? this.result.errors.map(safeError) : [],
+      sdk_error_code: sdkErrorCode(this.result?.error_code) ?? this.exception?.result_error_code ?? null,
+      sdk_exception: this.exception,
       model_requests: rows.length || null, model_request_count_source: 'unique assistant request/message IDs',
       policy_calls: this.policyCalls, assistant_messages: rows.length, api_retries: this.apiRetries,
       api_retry_details: [...this.apiRetryDetails], api_error_categories: [...this.apiErrorCategories],

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ChatRequest, Decision } from './compat.js';
 import {recoverySummary,type RecoveryTrace} from './decision-recovery.js';
+import type { bridgeFailure, SDKExceptionDetails } from './failures.js';
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 export function sessionKeyHash(key: string | undefined): string | null {
@@ -34,6 +35,8 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   billing_tier?: string | null; requested_reasoning?: string | null;
   reasoning_guard?: { limit: number; reasoning_tokens: number; stopped: boolean } | null; reasoning_guard_stops?: number;
   upstream_failure?: {code:string;message:string}|null;
+  failure?: ReturnType<typeof bridgeFailure> | null;
+  sdk_error_code?: number | string | null; sdk_exception?: SDKExceptionDetails | null;
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -78,6 +81,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       total_session_credits: turn?.total_session_credits ?? null,
       model_policy_calls: turn?.model_policy_calls ?? [],
       upstream_failure:turn?.upstream_failure??null,
+      failure:turn?.failure??null, sdk_error_code:turn?.sdk_error_code??null, sdk_exception:turn?.sdk_exception??null,
       model_requests:turn?.model_requests??null,
       first_client_text_ms: turn?.first_client_text_ms ?? null,
       first_client_thinking_ms: turn?.first_client_thinking_ms ?? null, stream_chunks: turn?.stream_chunks ?? 0,

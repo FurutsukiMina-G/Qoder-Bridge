@@ -14,6 +14,7 @@ import { BRIDGE_MODELS, DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL, bridgeModel, req
 import {recoverDecision,recoverySummary,decisionRetryLimit,type RecoveryTrace} from './decision-recovery.js';
 import {assertToolContract} from './tool-contract.js';
 import {publicUpstreamFailure} from './diagnostics.js';
+import {bridgeFailure,type FailurePhase,type FailureInput} from './failures.js';
 
 export const PUBLIC_MODEL = DEFAULT_PUBLIC_MODEL;
 export const PUBLIC_PRO_MODEL = PRO_PUBLIC_MODEL;
@@ -50,7 +51,8 @@ export async function createBridgeServer(config: Config, options: {
   const key = options.key ?? await bridgeKey();
   const infer = options.infer ?? runProbe;
   const reports = { bridge: join(options.reportDir ?? 'reports', 'bridge.ndjson'),
-    tasks: join(options.reportDir ?? 'reports', 'tasks.ndjson') };
+    tasks: join(options.reportDir ?? 'reports', 'tasks.ndjson'),
+    errors: join(options.reportDir ?? 'reports', 'errors.ndjson') };
   if (config.model && config.model !== BRIDGE_MODELS[0].runtimeId)
     throw new Error('serve selects Flash/Pro through request.model; omit --model when serving both models');
   const pools = new Map<string, QoderPool>();
@@ -74,18 +76,26 @@ export async function createBridgeServer(config: Config, options: {
   const server = createServer(async (req, res) => {
     const startedAt = Date.now();
     const bridgeRequestId = randomUUID();
+    res.setHeader('x-qoderbridge-request-id', bridgeRequestId);
+    // The Bridge owns bounded corrections. Do not add SDK HTTP status retries around the whole operation.
+    res.setHeader('x-should-retry', 'false');
     let taskRequest: ChatRequest | undefined;
     let requestAccepted = false;
     let taskTurn: Parameters<typeof taskLogEntry>[0]['turn'];
     let decisionRecovery: RecoveryTrace | undefined;
     let upstreamFailure:ReturnType<typeof publicUpstreamFailure> = null;
+    let failurePhase: FailurePhase = 'request';
+    let failureTurn: FailureInput['turn'];
+    let abortKind: FailureInput['abort'];
     const controller = new AbortController();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     let firstClientTextMs: number | null = null;
     let firstClientThinkingMs: number | null = null;
     let streamChunks = 0;
-    const disconnect = () => { if (!res.writableEnded) controller.abort(new Error('Harness client disconnected')); };
+    const disconnect = () => { if (!res.writableEnded && !controller.signal.aborted) {
+      abortKind = 'client_disconnect'; controller.abort(new Error('Harness client disconnected'));
+    } };
     res.once('close', disconnect);
     const streamBase = { id: `chatcmpl-${bridgeRequestId}`, object: 'chat.completion.chunk',
       created: Math.floor(startedAt / 1000), model: PUBLIC_MODEL as string };
@@ -112,6 +122,16 @@ export async function createBridgeServer(config: Config, options: {
           decision, bridgeRequestId, startedAt, error, bridgePort }));
       } catch (cause) { process.stderr.write(`[bridge] Task logging failed: ${safeError(cause)}\n`); }
     };
+    const recordFailure = async (error: ReturnType<typeof bridgeFailure>) => {
+      try { await appendReport(reports.errors, { schema: 'qoderbridge-error-v1', time: new Date().toISOString(),
+        bridge_request_id: bridgeRequestId, bridge_port: bridgePort, error }); }
+      catch (cause) { process.stderr.write(`[bridge] Error logging failed: ${safeError(cause)}\n`); }
+    };
+    const earlyFailure = async (kind: 'authentication' | 'route', status: number) => {
+      const error = bridgeFailure({ requestId: bridgeRequestId, phase: 'request', accepted: false, early: kind });
+      if (kind === 'authentication') error.type = 'authentication_error';
+      await recordFailure(error); send(res, status, { error });
+    };
     try {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, {
@@ -121,6 +141,8 @@ export async function createBridgeServer(config: Config, options: {
         activeRequests: slots.active, queuedRequests: slots.queued, pool: pool?.stats() ?? null,
         pools: Object.fromEntries([...pools].map(([model, value]) => [model, value.stats()])),
         capabilities: { finalTextStreaming: true, thinkingStreaming: true, validatedTools: true,
+          errorDiagnostics: { version: 1, origins: ['account','bridge','model_output','upstream','dsh_request','connection','unknown'],
+            visibleMessage: true, sdkErrorCode: true, requestId: true },
           decisionRecovery: {maxCorrectionCalls:decisionRetryLimit(config.decisionRetries),
             beforeToolDispatch:true,retriesRuntimeFailures:false},
           usage: 'qoder-context-ratio+stream-token-deltas',
@@ -129,14 +151,14 @@ export async function createBridgeServer(config: Config, options: {
           reasoningGuard: { maxReasoningTokensBeforeOutput: config.reasoningGuardTokens ?? DEFAULT_REASONING_GUARD_TOKENS,
             retryReasoningEffort: config.reasoning === 'max' ? 'high' : config.reasoning ?? null } },
       });
-      if (req.headers.authorization !== `Bearer ${key}`) return send(res, 401, { error: { message: 'Unauthorized', type: 'authentication_error' } });
+      if (req.headers.authorization !== `Bearer ${key}`) return await earlyFailure('authentication', 401);
       if (req.method === 'GET' && url.pathname === '/v1/models') return send(res, 200, {
         object: 'list', data: BRIDGE_MODELS.map(model => ({ id: model.id, name: model.name,
           object: 'model', created: 0, owned_by: 'qoderbridge', context_window: model.contextWindow,
           reasoning_efforts: model.efforts })),
       });
       if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions')
-        return send(res, 404, { error: { message: 'Not found', type: 'invalid_request_error' } });
+        return await earlyFailure('route', 404);
       const raw = await body(req);
       const request = ChatRequest.parse(raw);
       taskRequest = request;
@@ -147,7 +169,9 @@ export async function createBridgeServer(config: Config, options: {
       assertTextRequest(request);
       assertToolContract(request);
       requestAccepted = true;
-      deadline = setTimeout(() => controller.abort(new Error('QoderBridge request deadline exceeded')), config.timeout);
+      deadline = setTimeout(() => { if (!controller.signal.aborted) {
+        abortKind = 'deadline'; controller.abort(new Error('QoderBridge request deadline exceeded'));
+      } }, config.timeout);
       if (request.stream) {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8',
           'cache-control': 'no-cache, no-transform', connection: 'keep-alive',
@@ -161,9 +185,11 @@ export async function createBridgeServer(config: Config, options: {
         }, 15000);
         heartbeat.unref();
       }
+      failurePhase = 'queue';
       const release = await slots.take(controller.signal);
       try {
         controller.signal.throwIfAborted();
+        failurePhase = 'upstream';
         const selectedPool = poolFor(request.model);
         const pooled = selectedPool ? await selectedPool.infer(request, { signal: controller.signal, reasoningEffort,
           onText: request.stream ? text => projector.push(text) : undefined,
@@ -183,18 +209,26 @@ export async function createBridgeServer(config: Config, options: {
             request.stream?text=>projector.push(text):()=>{})});
         decisionRecovery=pooled?.recovery??direct?.recovery;
         const turn=pooled?pooled.report:{...direct!.turn,decision_recovery:direct!.recovery};
-        upstreamFailure=turn.error?publicUpstreamFailure(turn.sdk_errors,turn.api_error_categories):null;
+        failureTurn = turn;
+        const decisionError=pooled?.decisionError??direct?.decisionError;
+        upstreamFailure=turn.error?publicUpstreamFailure(turn.sdk_errors,turn.api_error_categories,turn.sdk_error_code):null;
+        failurePhase = turn.error ? 'upstream' : 'decision';
+        const failure = turn.error || decisionError ? bridgeFailure({ requestId: bridgeRequestId,
+          phase: failurePhase, accepted: true, turn, recovery: decisionRecovery, abort: abortKind }) : null;
         taskTurn = { ...turn, first_client_text_ms: firstClientTextMs,
-          first_client_thinking_ms: firstClientThinkingMs, stream_chunks: streamChunks,upstream_failure:upstreamFailure };
+          first_client_thinking_ms: firstClientThinkingMs, stream_chunks: streamChunks,upstream_failure:upstreamFailure, failure };
+        const turnPhase = failurePhase;
+        failurePhase = 'reporting';
         await appendReport(reports.bridge, { ...turn, bridge_request_id: bridgeRequestId,
-          upstream_failure:upstreamFailure,
+          upstream_failure:upstreamFailure, failure,
           bridge_port: bridgePort,
           harness_message_count: request.messages.length, harness_tool_count: request.tools?.length ?? 0 });
+        failurePhase = turnPhase;
         if (turn.error) throw new Error(`Qoder inference failed at ${turn.stage}: ${turn.error}`);
-        const decisionError=pooled?.decisionError??direct?.decisionError;
         if (decisionError) throw new Error(decisionError);
         const decision = pooled?.decision ?? direct?.decision ?? parseDecision(turn.response, request);
         if (request.stream) projector.validate(decision);
+        failurePhase = 'delivery';
         const answer = completion(request, decision,pooled?.completionId);
         const usage = ('client_usage' in turn ? turn.client_usage as OpenAIUsage | null : null) ??
           ('normalized_usage' in turn ? turn.normalized_usage as OpenAIUsage | null : null);
@@ -220,18 +254,18 @@ export async function createBridgeServer(config: Config, options: {
       } finally { release(); }
     } catch (cause) {
       const message = safeError(cause);
-      await writeTaskLog(undefined, upstreamFailure?`${upstreamFailure.code}: ${upstreamFailure.message}`:message);
-      process.stderr.write(`[bridge] ${message}\n`);
-      const turnLimit = message.includes('Qoder result: error_max_turns');
-      const invalidArguments = /^Arguments for [\w.-]+ violate its schema/.test(message);
-      const exhausted=decisionRecovery&&['exhausted','repeated_invalid_decision'].includes(decisionRecovery.outcome);
-      const reasoningBudget=decisionRecovery?.outcome==='reasoning_budget';
-      const error = { message: upstreamFailure?.message??(turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
-        : !requestAccepted?message.slice(0,300):invalidArguments ? message.slice(0, 300) : exhausted ? 'Model decision correction limit reached; no rejected tool call was dispatched. Review the request before continuing.'
-        : reasoningBudget ? 'Model reasoning exceeded the bridge budget on every attempt before any decision; nothing was dispatched.' : 'QoderBridge could not complete the model request'), type: requestAccepted?'upstream_error':'invalid_request_error',
-        code:!requestAccepted?'invalid_request_error':controller.signal.aborted ? 'request_cancelled_or_timeout' :upstreamFailure?.code??(turnLimit ? 'qoder_turn_limit'
-          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':reasoningBudget?'qoder_reasoning_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error'), request_id: bridgeRequestId,
-        ...(decisionRecovery?{decision_recovery:recoverySummary(decisionRecovery)}:{}) };
+      const failure = bridgeFailure({ requestId: bridgeRequestId, phase: failurePhase, accepted: requestAccepted,
+        cause, abort: abortKind, turn: failureTurn, recovery: decisionRecovery });
+      taskTurn = { ...taskTurn, failure };
+      await recordFailure(failure);
+      await writeTaskLog(undefined, failure.message);
+      process.stderr.write(`[bridge] ${failure.code} request=${bridgeRequestId}: ${message}\n`);
+      const error = { ...failure,
+        ...(decisionRecovery?{decision_recovery:{...recoverySummary(decisionRecovery),
+          // Validation errors can contain arbitrary rejected names/arguments or upstream payloads.
+          // Full evidence remains local; the client needs only counts, outcome and correlation hashes.
+          failures:decisionRecovery.evidence.filter(row=>row.validationError).map(row=>({
+            attempt:row.attempt,stage:row.stage,responseSha256:row.responseSha256}))}}:{}) };
       if (!res.headersSent) send(res, requestAccepted ? 502 : 400, { error });
       else if (!res.destroyed) { res.write(`data: ${JSON.stringify({ error })}\n\n`); res.end(); }
     } finally {

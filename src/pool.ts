@@ -270,6 +270,7 @@ export class QoderPool {
             if (failed && !guardTripped) throw new Error(`Qoder result: ${telemetry.result?.subtype ?? 'missing'}`);
           } catch (error) {
             inferenceError = safeError(error);
+            telemetry.captureException(error);
             this.close(record);
           } finally { policy.reasoning = null; }
           const reasoningGuardStopped = guardTripped && !inferenceError &&

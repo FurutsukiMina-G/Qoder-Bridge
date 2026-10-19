@@ -7,7 +7,7 @@ import type { Config } from '../src/client.js';
 
 const request = ChatRequest.parse({ model: 'qoder-deepseek-flash', prompt_cache_key: 'test-session',
   messages: [{ role: 'user', content: 'Answer OK' }] });
-function fakePool(timeout = 5000, stalled = false, fail = false) {
+function fakePool(timeout = 5000, stalled = false, fail = false, sdkCode?: number) {
   const config: Config = { auth: 'cli', timeout, strategy: 'permission', system: 'test' };
   let phase = 0; let prompts = 0; let closed = 0;
   const record = { id: 'fake', messages: [], touched: Date.now(), locked: Promise.resolve(),
@@ -19,6 +19,7 @@ function fakePool(timeout = 5000, stalled = false, fail = false) {
         message: { id: String(phase), content: [{ type: 'text', text: '{"kind":"final","content":"OK"}' }],
           usage: { input_tokens: 0, output_tokens: 0 } } } };
       return { done: false, value: { type: 'result', session_id: 'sdk-fake', subtype: fail ? 'error_during_execution' : 'success', is_error: fail,
+        ...(sdkCode === undefined ? {} : { error_code: sdkCode }),
         total_credits: prompts * 0.1, usage: {}, modelUsage: {} } };
     } } };
   const pool = new QoderPool(config);
@@ -26,6 +27,16 @@ function fakePool(timeout = 5000, stalled = false, fail = false) {
   state.nextWarm = Promise.resolve(record); state.primeNext = () => Promise.resolve(record);
   return { pool, record, counts: () => ({ prompts, closed }) };
 }
+
+test('pooled SDK terminal errors retain structured codes through recovery and do not retry account limits', async () => {
+  const { pool, counts } = fakePool(5000, false, true, 115);
+  try {
+    const result = await pool.infer(request);
+    assert.equal(result.report.sdk_error_code, 115);
+    assert.equal(result.recovery!.outcome, 'upstream_failure');
+    assert.equal(result.recovery!.correctionCalls, 0); assert.equal(counts().prompts, 1);
+  } finally { pool.closeAll(); }
+});
 test('cancelled permit waiters are removed and a release never overbooks concurrency', async () => {
   const slots = new RequestSlots(1); const first = await slots.take();
   const controller = new AbortController(); const pending = slots.take(controller.signal);
