@@ -13,6 +13,7 @@ import type { OpenAIUsage } from './usage.js';
 import { BRIDGE_MODELS, DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL, bridgeModel, requestedEffort } from './model.js';
 import {recoverDecision,recoverySummary,decisionRetryLimit,type RecoveryTrace} from './decision-recovery.js';
 import {assertToolContract} from './tool-contract.js';
+import {publicUpstreamFailure} from './diagnostics.js';
 
 export const PUBLIC_MODEL = DEFAULT_PUBLIC_MODEL;
 export const PUBLIC_PRO_MODEL = PRO_PUBLIC_MODEL;
@@ -77,6 +78,7 @@ export async function createBridgeServer(config: Config, options: {
     let requestAccepted = false;
     let taskTurn: Parameters<typeof taskLogEntry>[0]['turn'];
     let decisionRecovery: RecoveryTrace | undefined;
+    let upstreamFailure:ReturnType<typeof publicUpstreamFailure> = null;
     const controller = new AbortController();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -181,9 +183,11 @@ export async function createBridgeServer(config: Config, options: {
             request.stream?text=>projector.push(text):()=>{})});
         decisionRecovery=pooled?.recovery??direct?.recovery;
         const turn=pooled?pooled.report:{...direct!.turn,decision_recovery:direct!.recovery};
+        upstreamFailure=turn.error?publicUpstreamFailure(turn.sdk_errors,turn.api_error_categories):null;
         taskTurn = { ...turn, first_client_text_ms: firstClientTextMs,
-          first_client_thinking_ms: firstClientThinkingMs, stream_chunks: streamChunks };
+          first_client_thinking_ms: firstClientThinkingMs, stream_chunks: streamChunks,upstream_failure:upstreamFailure };
         await appendReport(reports.bridge, { ...turn, bridge_request_id: bridgeRequestId,
+          upstream_failure:upstreamFailure,
           bridge_port: bridgePort,
           harness_message_count: request.messages.length, harness_tool_count: request.tools?.length ?? 0 });
         if (turn.error) throw new Error(`Qoder inference failed at ${turn.stage}: ${turn.error}`);
@@ -216,17 +220,17 @@ export async function createBridgeServer(config: Config, options: {
       } finally { release(); }
     } catch (cause) {
       const message = safeError(cause);
-      await writeTaskLog(undefined, message);
+      await writeTaskLog(undefined, upstreamFailure?`${upstreamFailure.code}: ${upstreamFailure.message}`:message);
       process.stderr.write(`[bridge] ${message}\n`);
       const turnLimit = message.includes('Qoder result: error_max_turns');
       const invalidArguments = /^Arguments for [\w.-]+ violate its schema/.test(message);
       const exhausted=decisionRecovery&&['exhausted','repeated_invalid_decision'].includes(decisionRecovery.outcome);
       const reasoningBudget=decisionRecovery?.outcome==='reasoning_budget';
-      const error = { message: turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
+      const error = { message: upstreamFailure?.message??(turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
         : !requestAccepted?message.slice(0,300):invalidArguments ? message.slice(0, 300) : exhausted ? 'Model decision correction limit reached; no rejected tool call was dispatched. Review the request before continuing.'
-        : reasoningBudget ? 'Model reasoning exceeded the bridge budget on every attempt before any decision; nothing was dispatched.' : 'QoderBridge could not complete the model request', type: requestAccepted?'upstream_error':'invalid_request_error',
-        code:!requestAccepted?'invalid_request_error':controller.signal.aborted ? 'request_cancelled_or_timeout' : turnLimit ? 'qoder_turn_limit'
-          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':reasoningBudget?'qoder_reasoning_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId,
+        : reasoningBudget ? 'Model reasoning exceeded the bridge budget on every attempt before any decision; nothing was dispatched.' : 'QoderBridge could not complete the model request'), type: requestAccepted?'upstream_error':'invalid_request_error',
+        code:!requestAccepted?'invalid_request_error':controller.signal.aborted ? 'request_cancelled_or_timeout' :upstreamFailure?.code??(turnLimit ? 'qoder_turn_limit'
+          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':reasoningBudget?'qoder_reasoning_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error'), request_id: bridgeRequestId,
         ...(decisionRecovery?{decision_recovery:recoverySummary(decisionRecovery)}:{}) };
       if (!res.headersSent) send(res, requestAccepted ? 502 : 400, { error });
       else if (!res.destroyed) { res.write(`data: ${JSON.stringify({ error })}\n\n`); res.end(); }

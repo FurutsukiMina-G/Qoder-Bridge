@@ -18,6 +18,8 @@ Bridge 默认在**同一个 HTTP 请求、同一个 Qoder 会话、同一把会�
 
 相同成功请求的本地重放保留原工具调用 ID，避免网络重试把同一个已生成调用包装成新调用。该机制在现有短时成功重放窗口内生效，不替代 Harness 的工具执行去重和会话状态。
 
+SDK 明确报告每日额度、计费/额度、认证或限流错误时，HTTP/SSE 直接给出对应的 `upstream_daily_limit`、`upstream_billing_error`、`upstream_authentication_failed` 或 `upstream_rate_limit` 及安全的固定说明，不再只显示泛化的 Bridge 错误。识别仅依据 SDK 失败元数据，不读取模型正文或工具输出，不追加自动重试，也不猜额度恢复时间。
+
 参数 `--decision-retries 0|1|2` 可设置纠正次数，默认 `2`。`0` 用于排查时关闭内部纠正；SDK 自己的单轮限制保持不变。总请求期限包含排队、首次生成和所有纠正，不因纠正重新计时。
 
 ## 观察与用量

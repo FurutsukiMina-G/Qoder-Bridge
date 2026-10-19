@@ -33,6 +33,7 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
     residualTokens: number } | null;
   billing_tier?: string | null; requested_reasoning?: string | null;
   reasoning_guard?: { limit: number; reasoning_tokens: number; stopped: boolean } | null; reasoning_guard_stops?: number;
+  upstream_failure?: {code:string;message:string}|null;
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -76,6 +77,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       credits_delta_source: turn?.credits_delta_source ?? (turn?.local_response_replay ? 'local_replay' : 'unavailable'),
       total_session_credits: turn?.total_session_credits ?? null,
       model_policy_calls: turn?.model_policy_calls ?? [],
+      upstream_failure:turn?.upstream_failure??null,
       model_requests:turn?.model_requests??null,
       first_client_text_ms: turn?.first_client_text_ms ?? null,
       first_client_thinking_ms: turn?.first_client_thinking_ms ?? null, stream_chunks: turn?.stream_chunks ?? 0,
