@@ -342,6 +342,43 @@ test('a supplied tool discriminator wraps flat arguments without changing ranges
     kind: 'tool_call', name: 'label', arguments: { name: 'actual parameter' },
   });
 });
+
+test('a supplied tool discriminator retains one complete packed arguments object', () => {
+  const args = { file_path: 'ReceiverSession.java', offset: 200, limit: 35 };
+  const repairs: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision(JSON.stringify({ kind: 'read', arguments: args }), readRequest,
+    repair => repairs.push(repair)), { kind: 'tool_call', name: 'read', arguments: args });
+  assert.deepEqual(repairs, [{ kind: 'flat_tool_kind', tool: 'read', parameter: 'kind' }]);
+  const ownArguments = ChatRequest.parse({ ...request, tools: [{ type: 'function', function: {
+    name: 'store', parameters: { type: 'object', properties: { arguments: { type: 'object' } },
+      required: ['arguments'], additionalProperties: false },
+  } }] });
+  assert.deepEqual(parseDecision('{"kind":"store","arguments":{"opaque":true}}', ownArguments), {
+    kind: 'tool_call', name: 'store', arguments: { arguments: { opaque: true } },
+  });
+});
+
+test('packed tool discriminators keep complete boundaries, schema and tool-choice checks', () => {
+  for (const source of [
+    { kind: 'unknown', arguments: { file_path: 'file.py' } },
+    { kind: 'read', arguments: {} },
+    { kind: 'read', arguments: { file_path: 'file.py', offset: '200' } },
+    { kind: 'read', arguments: { file_path: 'file.py', unknown: true } },
+    { kind: 'read', arguments: { file_path: 'file.py' }, offset: 200 },
+    { kind: 'read', arguments: [{ file_path: 'file.py' }] },
+    { kind: 'read', arguments: '{"file_path":"file.py"}' },
+  ]) {
+    const repairs: DecisionRepair[] = [];
+    assert.throws(() => parseDecision(JSON.stringify(source), readRequest, repair => repairs.push(repair)));
+    assert.deepEqual(repairs, []);
+  }
+  const source = '{"kind":"read","arguments":{"file_path":"file.py"}}';
+  assert.throws(() => parseDecision(source.slice(0, -1), readRequest));
+  assert.throws(() => parseDecision(source + source, readRequest));
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...readRequest, tool_choice: 'none' })), /forbids/);
+  assert.throws(() => parseDecision(source, ChatRequest.parse({ ...readRequest,
+    tool_choice: { type: 'function', function: { name: 'grep' } } })), /unselected/);
+});
 test('an explicit custom tool envelope preserves opaque argument strings and never becomes a false final', () => {
   const args={file_path:'file.py',old_string:'literal \\n and \\"quote\\"',new_string:'    actual\n'};
   const source='<custom_tool_call>\n'+JSON.stringify({name:'edit',arguments:args})+'\n</custom_tool_call>';

@@ -640,11 +640,15 @@ function decisionObject(value: unknown, request: ChatRequest, repairs: DecisionR
       { properties?: Record<string, unknown> } | undefined : undefined;
     const keys = Object.keys(row).filter(key => key !== 'kind');
     // This observed form explicitly uses a provided tool as the discriminator.
-    // Move only declared fields; don't infer a tool from arbitrary JSON data.
+    // It can carry declared flat fields or one complete arguments object.
+    // Never unwrap a tool's own parameter named arguments or mix both forms.
+    const packed = keys.length === 1 && keys[0] === 'arguments' && schema?.properties &&
+      !Object.hasOwn(schema.properties, 'arguments') && row.arguments !== null &&
+      typeof row.arguments === 'object' && !Array.isArray(row.arguments);
     if (schema?.properties && !Object.hasOwn(schema.properties, 'kind') &&
-      keys.every(key => Object.hasOwn(schema.properties!, key))) {
+      (packed || keys.every(key => Object.hasOwn(schema.properties!, key)))) {
       const name = row.kind;
-      row = { kind: 'tool_call', name, arguments: Object.fromEntries(keys.map(key => [key, row[key]])) };
+      row = { kind: 'tool_call', name, arguments: packed ? row.arguments : Object.fromEntries(keys.map(key => [key, row[key]])) };
       recovered.push({ kind: 'flat_tool_kind', tool: name, parameter: 'kind' });
     }
   }
