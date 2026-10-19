@@ -33,7 +33,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'decision_wrapper_close' | 'parameter_boundary' | 'schema_matched_call' | 'empty_call_annotation' |
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
-  'attributed_call_envelope' | 'plain_tool_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
+  'attributed_call_envelope' | 'named_generic_wrapper' | 'plain_tool_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
   'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters'; tool: string; parameter: string };
 const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
@@ -389,6 +389,25 @@ function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepai
   const markerAt = marker?.index ?? -1;
   if (markerAt < 0) return null;
   text = text.slice(markerAt);
+  // A repeated observed wrapper names the generic adapter first, then one
+  // supplied native tool. Only a complete single call with one JSON object
+  // is unambiguous; never pick between native tools or discard batch members.
+  const namedWrapper = /^<｜｜DSML｜｜\s*(calls|tool_calls)>\s*<｜｜DSML｜｜\s*invoke name="tool_call" name="([A-Za-z_][\w.-]*)">\s*<｜｜DSML｜｜\s*parameter name="arguments" string="(?:true|false)">\s*(?=\{)/.exec(text);
+  if (namedWrapper) {
+    if ((request.tools ?? []).some(tool => tool.function.name === 'tool_call'))
+      throw new Error('Named generic wrapper conflicts with a supplied tool');
+    const provided = request.tools?.filter(tool => tool.function.name === namedWrapper[2]) ?? [];
+    if (provided.length !== 1) throw new Error('Named generic wrapper requires one supplied tool');
+    const schema = provided[0]!.function.parameters as { properties?: object } | undefined;
+    if (schema?.properties && Object.hasOwn(schema.properties, 'arguments'))
+      throw new Error('Named generic wrapper conflicts with a native arguments parameter');
+    const args = objectRange(text, namedWrapper[0].length);
+    const tail = /^\s*<\/｜｜DSML｜｜\s*parameter>\s*<\/｜｜DSML｜｜\s*invoke>\s*<\/｜｜DSML｜｜\s*(calls|tool_calls)>\s*$/.exec(text.slice(args.end));
+    if (!tail || tail[1] !== namedWrapper[1])
+      throw new Error('Named generic wrapper has extra or incomplete data');
+    repairs.push({ kind: 'named_generic_wrapper', tool: namedWrapper[2]!, parameter: 'call' });
+    return Decision.parse({ kind: 'tool_call', name: namedWrapper[2], arguments: args.value });
+  }
   const attributed = /^<｜｜DSML｜｜\s*calls>\s*<｜｜DSML｜｜\s*invoke name="tool_call_call" name="([A-Za-z_][\w-]*)" arguments="(?=\{)/.exec(text);
   if (attributed) {
     if ((request.tools ?? []).some(tool => tool.function.name === 'tool_call_call'))
