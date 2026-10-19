@@ -1,8 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import Ajv from 'ajv';
 import { z } from 'zod';
 import { diagnosticToolName } from './diagnostics.js';
+import {toolValidator} from './tool-contract.js';
 
 const Message = z.object({ role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
   content: z.unknown().optional(), tool_calls: z.array(z.unknown()).optional(),
@@ -35,7 +35,6 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
   'attributed_call_envelope' | 'named_generic_wrapper' | 'plain_tool_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
   'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters'; tool: string; parameter: string };
-const json = new Ajv.default({ allErrors: true, strict: false, validateFormats: false });
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
   catch (original) {
@@ -879,8 +878,8 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
     if (!names.includes(call.name) || (typeof selected === 'string' && selected !== call.name))
       throw new Error(`Unknown or unselected tool name: ${diagnosticToolName(call.name)}`);
     const schema = request.tools?.find(t => t.function.name === call.name)?.function.parameters;
-    if (schema && typeof schema === 'object') {
-      const validate = json.compile(schema);
+    if (typeof schema === 'boolean' || (schema && typeof schema === 'object')) {
+      const validate = toolValidator(schema);
       if (!validate(call.arguments)) {
         const detail = (validate.errors ?? []).slice(0, 2).map(error =>
           `${error.instancePath || '/'} ${error.message ?? error.keyword}`).join('; ');
@@ -946,17 +945,21 @@ export function conversationPrompt(request: ChatRequest, options: {
     `Do not return a progress-only final answer while host actions remain necessary.\n` +
     `For long write/edit content, issue one tool call at a time instead of batching large file edits. ` +
     `For edit, use the smallest unambiguous matching old_string instead of copying a whole file.\n` +
+    `Protocol check before sending: use JSON only, never DSML/XML or positional argument arrays. ` +
+    `Every required field must be present; use the schema's actual types (numbers are not quoted). ` +
+    `For read use named file_path/offset/limit when declared; for edit include complete old_string AND new_string; ` +
+    `for pwsh include its required description AND command. Finish every string/object before ending the response.\n` +
     `Tool choice: ${JSON.stringify(request.tool_choice ?? 'auto')}\n` +
     toolBlock +
     `Conversation (${options.historyMode === 'delta' ? 'new messages since the prior decision' : 'full history'}): ${JSON.stringify(transcript)}\n` +
     `Assistant decision:`;
 }
-export function completion(request: ChatRequest, decision: Decision) {
-  const id = `chatcmpl-${randomUUID()}`;
+export function completion(request: ChatRequest, decision: Decision, identity: string = randomUUID()) {
+  const id = `chatcmpl-${identity}`;
   const calls = decision.kind === 'final' ? [] : decision.kind === 'tool_call' ? [decision] : decision.calls;
   const message = decision.kind === 'final' ? { role: 'assistant', content: decision.content } : {
-    role: 'assistant', content: null, tool_calls: calls.map(call => ({
-      id: `call_${randomUUID().replaceAll('-', '')}`, type: 'function',
+    role: 'assistant', content: null, tool_calls: calls.map((call,index) => ({
+      id: `call_${createHash('sha256').update(`${identity}:${index}`).digest('hex').slice(0, 32)}`, type: 'function',
       function: { name: call.name, arguments: JSON.stringify(call.arguments) },
     })),
   };

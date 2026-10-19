@@ -903,7 +903,7 @@ test('SDK stop reasons and assistant content types remain available when max_tur
   assert.equal(report.total_session_credits, 1.2);
   assert.ok(!JSON.stringify(report).includes('private reasoning'));
 });
-test('Harness receives a useful schema/turn-limit error while invalid tools stay unexecuted', async () => {
+test('Harness receives a useful bounded-correction/turn-limit error while invalid tools stay unexecuted', async () => {
   const reportDir = await mkdtemp(join(tmpdir(), 'qoderbridge-repair-'));
   for (const turnLimit of [false, true]) {
     const fake = (async () => ({ response: turnLimit ? '' : '{"kind":"tool_call","name":"grep","arguments":{}}',
@@ -916,7 +916,8 @@ test('Harness receives a useful schema/turn-limit error while invalid tools stay
         headers: { authorization: 'Bearer test', 'content-type': 'application/json' }, body: JSON.stringify(request) });
       assert.equal(response.status, 502);
       const body = await response.json();
-      assert.equal(body.error.code, turnLimit ? 'qoder_turn_limit' : 'tool_arguments_invalid');
+      assert.equal(body.error.code, turnLimit ? 'qoder_turn_limit' : 'model_decision_recovery_exhausted');
+      assert.equal(body.error.decision_recovery.correctionCalls,turnLimit?0:1);
       assert.match(body.error.message, turnLimit ? /per-request turn limit/ : /pattern/);
       assert.ok(body.error.request_id);
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }

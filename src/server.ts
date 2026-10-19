@@ -11,6 +11,8 @@ import { RequestSlots } from './async.js';
 import { FinalTextProjector } from './streaming.js';
 import type { OpenAIUsage } from './usage.js';
 import { BRIDGE_MODELS, DEFAULT_PUBLIC_MODEL, PRO_PUBLIC_MODEL, bridgeModel } from './model.js';
+import {recoverDecision,recoverySummary,decisionRetryLimit,type RecoveryTrace} from './decision-recovery.js';
+import {assertToolContract} from './tool-contract.js';
 
 export const PUBLIC_MODEL = DEFAULT_PUBLIC_MODEL;
 export const PUBLIC_PRO_MODEL = PRO_PUBLIC_MODEL;
@@ -41,6 +43,7 @@ export async function createBridgeServer(config: Config, options: {
   port?: number; key?: string; infer?: typeof runProbe; reportDir?: string;
 } = {}) {
   const bridgePort = options.port ?? 8646;
+  decisionRetryLimit(config.decisionRetries);
   const key = options.key ?? await bridgeKey();
   const infer = options.infer ?? runProbe;
   const reports = { bridge: join(options.reportDir ?? 'reports', 'bridge.ndjson'),
@@ -70,6 +73,7 @@ export async function createBridgeServer(config: Config, options: {
     let taskRequest: ChatRequest | undefined;
     let requestAccepted = false;
     let taskTurn: Parameters<typeof taskLogEntry>[0]['turn'];
+    let decisionRecovery: RecoveryTrace | undefined;
     const controller = new AbortController();
     let deadline: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -104,6 +108,8 @@ export async function createBridgeServer(config: Config, options: {
         activeRequests: slots.active, queuedRequests: slots.queued, pool: pool?.stats() ?? null,
         pools: Object.fromEntries([...pools].map(([model, value]) => [model, value.stats()])),
         capabilities: { finalTextStreaming: true, thinkingStreaming: true, validatedTools: true,
+          decisionRecovery: {maxCorrectionCalls:decisionRetryLimit(config.decisionRetries),
+            beforeToolDispatch:true,retriesRuntimeFailures:false},
           usage: 'qoder-context-ratio+stream-token-deltas',
           cacheUsage: config.cacheUsage === 'estimate' ? 'session-prefix-estimate' : 'not-reported' },
       });
@@ -120,6 +126,7 @@ export async function createBridgeServer(config: Config, options: {
       if (!bridgeModel(request.model)) throw new Error(`Unknown model: ${request.model}`);
       streamBase.model = request.model;
       assertTextRequest(request);
+      assertToolContract(request);
       requestAccepted = true;
       deadline = setTimeout(() => controller.abort(new Error('QoderBridge request deadline exceeded')), config.timeout);
       if (request.stream) {
@@ -141,19 +148,27 @@ export async function createBridgeServer(config: Config, options: {
             emit({ reasoning_content: text });
           } : undefined,
           validateDecision: request.stream ? decision => projector.validate(decision) : undefined,
+          prepareDecisionRetry:request.stream?()=>projector.resetUncommitted():undefined,
         }) : null;
-        const turn = pooled ? pooled.report : await infer(requestConfig(request.model), conversationPrompt(request), undefined,
-          request.stream ? text => projector.push(text) : () => {});
+        const direct=pooled?null:await recoverDecision({request,prompt:conversationPrompt(request),
+          retries:config.decisionRetries,signal:controller.signal,
+          prepareRetry:request.stream?()=>projector.resetUncommitted():undefined,
+          validateDecision:request.stream?decision=>projector.validate(decision):undefined,
+          invoke:async prompt=>infer(requestConfig(request.model),prompt,undefined,
+            request.stream?text=>projector.push(text):()=>{})});
+        decisionRecovery=pooled?.recovery??direct?.recovery;
+        const turn=pooled?pooled.report:{...direct!.turn,decision_recovery:direct!.recovery};
         taskTurn = { ...turn, first_client_text_ms: firstClientTextMs,
           first_client_thinking_ms: firstClientThinkingMs, stream_chunks: streamChunks };
         await appendReport(reports.bridge, { ...turn, bridge_request_id: bridgeRequestId,
           bridge_port: bridgePort,
           harness_message_count: request.messages.length, harness_tool_count: request.tools?.length ?? 0 });
         if (turn.error) throw new Error(`Qoder inference failed at ${turn.stage}: ${turn.error}`);
-        if (pooled?.decisionError) throw new Error(pooled.decisionError);
-        const decision = pooled?.decision ?? parseDecision(turn.response, request);
+        const decisionError=pooled?.decisionError??direct?.decisionError;
+        if (decisionError) throw new Error(decisionError);
+        const decision = pooled?.decision ?? direct?.decision ?? parseDecision(turn.response, request);
         if (request.stream) projector.validate(decision);
-        const answer = completion(request, decision);
+        const answer = completion(request, decision,pooled?.completionId);
         const usage = ('client_usage' in turn ? turn.client_usage as OpenAIUsage | null : null) ??
           ('normalized_usage' in turn ? turn.normalized_usage as OpenAIUsage | null : null);
         if (selectedPool && pooled && 'tool_calls' in answer.choices[0]!.message) {
@@ -182,10 +197,12 @@ export async function createBridgeServer(config: Config, options: {
       process.stderr.write(`[bridge] ${message}\n`);
       const turnLimit = message.includes('Qoder result: error_max_turns');
       const invalidArguments = /^Arguments for [\w.-]+ violate its schema/.test(message);
+      const exhausted=decisionRecovery&&['exhausted','repeated_invalid_decision'].includes(decisionRecovery.outcome);
       const error = { message: turnLimit ? 'Qoder SDK reached its per-request turn limit without a completed model decision.'
-        : invalidArguments ? message.slice(0, 300) : 'QoderBridge could not complete the model request', type: 'upstream_error',
-        code: controller.signal.aborted ? 'request_cancelled_or_timeout' : turnLimit ? 'qoder_turn_limit'
-          : invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId };
+        : !requestAccepted?message.slice(0,300):invalidArguments ? message.slice(0, 300) : exhausted ? 'Model decision correction limit reached; no rejected tool call was dispatched. Review the request before continuing.' : 'QoderBridge could not complete the model request', type: requestAccepted?'upstream_error':'invalid_request_error',
+        code:!requestAccepted?'invalid_request_error':controller.signal.aborted ? 'request_cancelled_or_timeout' : turnLimit ? 'qoder_turn_limit'
+          : decisionRecovery?.outcome==='output_budget'?'qoder_output_budget':exhausted?'model_decision_recovery_exhausted':invalidArguments ? 'tool_arguments_invalid' : 'model_decision_error', request_id: bridgeRequestId,
+        ...(decisionRecovery?{decision_recovery:recoverySummary(decisionRecovery)}:{}) };
       if (!res.headersSent) send(res, requestAccepted ? 502 : 400, { error });
       else if (!res.destroyed) { res.write(`data: ${JSON.stringify({ error })}\n\n`); res.end(); }
     } finally {

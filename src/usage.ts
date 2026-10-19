@@ -78,3 +78,21 @@ export function withCachedTokens(usage: OpenAIUsage, cached: number): OpenAIUsag
   return { ...usage, prompt_tokens_details: { cached_tokens: Math.min(cached, usage.prompt_tokens) } };
 }
 export const ZERO_USAGE: Readonly<OpenAIUsage> = Object.freeze({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+
+/** Sum actual attempt usage; a missing attempt must stay unknown rather than becoming zero. */
+export function sumOpenAIUsage(values: Array<OpenAIUsage | null | undefined>): OpenAIUsage | null {
+  if (!values.length || values.some(value => !value)) return null;
+  const rows = values as OpenAIUsage[];
+  const sum = (key: 'prompt_tokens' | 'completion_tokens' | 'total_tokens') => rows.reduce((n, row) => n + row[key], 0);
+  return { prompt_tokens: sum('prompt_tokens'), completion_tokens: sum('completion_tokens'), total_tokens: sum('total_tokens'),
+    ...(rows.every(row => row.prompt_tokens_details) ? { prompt_tokens_details: {
+      cached_tokens: rows.reduce((n, row) => n + row.prompt_tokens_details!.cached_tokens, 0),
+      ...(rows.every(row => row.prompt_tokens_details?.cache_write_tokens !== undefined) ? {
+        cache_write_tokens: rows.reduce((n, row) => n + row.prompt_tokens_details!.cache_write_tokens!, 0),
+      } : {}),
+    } } : {}),
+    ...(rows.every(row => row.completion_tokens_details?.reasoning_tokens !== undefined) ? { completion_tokens_details: {
+      reasoning_tokens: rows.reduce((n, row) => n + row.completion_tokens_details!.reasoning_tokens!, 0),
+    } } : {}),
+  };
+}

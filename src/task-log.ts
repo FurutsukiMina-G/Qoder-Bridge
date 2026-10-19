@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ChatRequest, Decision } from './compat.js';
+import {recoverySummary,type RecoveryTrace} from './decision-recovery.js';
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 export function sessionKeyHash(key: string | undefined): string | null {
@@ -26,6 +27,8 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   cache_estimate_tokens?: number | null; cache_estimate_ratio?: number | null; context_usage_ratio?: number | null;
   decision_repairs?: unknown[]; stream_stop_reasons?: string[];
   api_retries?: number; api_retry_details?: unknown[]; api_error_categories?: string[]; model_queue_statuses?: unknown[];
+  decision_recovery?: RecoveryTrace;
+  model_requests?: number | null;
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -69,6 +72,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       credits_delta_source: turn?.credits_delta_source ?? (turn?.local_response_replay ? 'local_replay' : 'unavailable'),
       total_session_credits: turn?.total_session_credits ?? null,
       model_policy_calls: turn?.model_policy_calls ?? [],
+      model_requests:turn?.model_requests??null,
       first_client_text_ms: turn?.first_client_text_ms ?? null,
       first_client_thinking_ms: turn?.first_client_thinking_ms ?? null, stream_chunks: turn?.stream_chunks ?? 0,
       local_response_replay: turn?.local_response_replay ?? false,
@@ -78,6 +82,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       reasoning_tokens: turn?.reasoning_tokens ?? null, output_tokens_per_second: turn?.output_tokens_per_second ?? null,
       context_usage_ratio: turn?.context_usage_ratio ?? null,
       decision_repairs: turn?.decision_repairs ?? [], stream_stop_reasons: turn?.stream_stop_reasons ?? [],
+      decision_recovery:turn?.decision_recovery?recoverySummary(turn.decision_recovery):null,
       api_retries: turn?.api_retries ?? null, api_retry_details: turn?.api_retry_details ?? [],
       api_error_categories: turn?.api_error_categories ?? [], model_queue_statuses: turn?.model_queue_statuses ?? [],
       cache_status: turn?.cache_usage_status ?? 'unavailable', cache_hit_ratio: turn?.cache_hit_ratio ?? null,

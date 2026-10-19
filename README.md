@@ -4,6 +4,8 @@
 
 可以直接在 DeepSeek Harness 创建任务测试。新任务的轮次和 Qoder 用量会写入本机 `reports/tasks.ndjson`，并可用 `npm.cmd run tasks:report` 汇总；见 [日志说明](docs/task-logging.md)。
 
+Bridge 现默认在同一请求内自行纠正工具格式/参数错误，最多额外两次；同一会话、原期限和完整 schema 校验不变，拒绝的工具不会执行。失败耗尽后相同请求断路，成功重放保留工具调用 ID；所有尝试用量单独留证并合计。额度、取消、权限和预算错误不进入格式重试。运行边界与验证见 [请求内决策恢复](docs/decision-recovery.md)。
+
 **仓库不含本机数据。** `reports/`（任务日志、遥测、审计与验收报告）、`.runtime/`（桥接密钥、Harness 本地会话凭据、SDK 工作目录与备份）和 `local/`（本机笔记与绑定真实会话的脚本）均被 `.gitignore` 排除；文档中出现的这些路径指本机生成的文件。首次 `serve` 会在 `.runtime/bridge-key` 随机生成本机密钥，Qoder 登录态由官方 CLI 保存在用户目录，均不进入仓库。
 
 不用启动 Qoder CN 桌面端也可尝试查询账户余额：运行 `npm.cmd run balance`，它通过官方 SDK 的 `getUsageInfo()` 读取额度，不发模型请求。当前这台机器的 SDK 返回 `null`，余额因此未知；可运行 `npm.cmd run qoder:tui`，在官方 CLI 中输入 `/usage`，或登录 Qoder CN 官网查看 Settings > Usage。Bridge 本身也不依赖桌面端常驻。

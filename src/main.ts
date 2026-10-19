@@ -17,6 +17,7 @@ async function main() {
     help: { type: 'boolean', short: 'h' },
     port: { type: 'string', default: '8646' },
     'cache-usage': { type: 'string', default: process.env.QODERBRIDGE_CACHE_USAGE ?? 'none' },
+    'decision-retries': { type: 'string', default: '2' },
   } });
   const [command, ...args] = positionals;
   if (values.help || !command) {
@@ -29,6 +30,7 @@ async function main() {
 Options: --auth auto|cli|pat --timeout MS --cli-path PATH --proxy URL
          --reasoning LEVEL --context TOKENS --system-file FILE --log FILE
          --session-settings FILE (explicit session-only settings JSON)
+         --decision-retries 0|1|2 (serve; bounded model correction before tools are dispatched)
          --cache-usage none|estimate (serve; env QODERBRIDGE_CACHE_USAGE). Qoder reports no
            cache counts; estimate sends the session-prefix estimate as cached_tokens
 Uses QODERCN_PERSONAL_ACCESS_TOKEN when set, otherwise official CLI login.
@@ -51,6 +53,7 @@ Native tool-result replay runs after interception passes; history auditing remai
     proxy: values.proxy, strategy: values.strategy as Config['strategy'],
     sessionSettings: values['session-settings'] ? JSON.stringify(JSON.parse(await readFile(values['session-settings'], 'utf8'))) : undefined,
     cacheUsage: values['cache-usage'] as Config['cacheUsage'],
+    decisionRetries:Number(values['decision-retries']),
     system: values['system-file'] ? await readFile(values['system-file'], 'utf8') :
       'Follow the user request directly. The host owns planning and tool execution. Be concise.',
   };

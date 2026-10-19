@@ -3,11 +3,13 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { rpc } from './dsh-rpc.js';
 import { diagnosticSummary } from '../src/diagnostics.js';
 import { monitorSignals, pendingApproval, type MonitorState } from '../src/monitor-state.js';
+import {requestAccounting} from '../src/request-metrics.js';
 
 type TaskEvent = {
   time: string; harness_session_key_hash: string | null; status: string; error: string | null;
   output?: { kind?: string; name?: string; calls?: Array<{ name: string }> } | null;
-  telemetry?: { credits_delta?: number | null; wall_ms?: number | null; local_response_replay?: boolean };
+  telemetry?: { credits_delta?: number | null; wall_ms?: number | null; local_response_replay?: boolean;
+    model_requests?:number|null;decision_recovery?:{knownCreditsSubtotal?:number;correctionCalls?:number;outcome?:string}|null };
 };
 const described = await rpc('settings/describe');
 const baseURL = described.namespaces.find((entry: { ns: string }) => entry.ns === 'llm-pi-ai')
@@ -51,16 +53,20 @@ const records: Array<{ sessionId: string; eventSeq: number | null; running: bool
   const values = item.projections?.values ?? {};
   const credits = turns.map(turn => turn.telemetry?.credits_delta);
   const errors = turns.filter(turn => turn.error);
+  const accounting=requestAccounting(turns);
   return {
     sessionId: item.sessionId, parentSessionId: item.parentSessionId ?? null,
     keyHash: key, cwd: item.cwd ?? null,
     title: values.title ?? null, running: item.running, eventSeq: item.projections?.asOfSeq ?? null,
     turns: values.sessionStats?.turns ?? null, steps: values.sessionStats?.steps ?? null,
     lastPromptAt: values.sessionListMetadata?.lastPromptAt ?? null,
-    modelRequests: turns.filter(turn => !turn.telemetry?.local_response_replay).length,
+    modelRequests: accounting.upstreamModelRequestCountUnknown?null:accounting.upstreamModelRequestsKnown,
+    bridgeRequests:accounting.bridgeRequests,upstreamModelRequestsKnown:accounting.upstreamModelRequestsKnown,
+    upstreamModelRequestCountUnknown:accounting.upstreamModelRequestCountUnknown,
+    correctionCalls:accounting.correctionCalls,recoveredRequests:accounting.recoveredRequests,
     localReplays: turns.filter(turn => turn.telemetry?.local_response_replay).length,
     credits: credits.every(x => typeof x === 'number' && Number.isFinite(x)) ? credits.reduce<number>((sum, x) => sum + (x ?? 0), 0) : null,
-    knownCredits: credits.reduce<number>((sum, x) => sum + (typeof x === 'number' && Number.isFinite(x) ? x : 0), 0),
+    knownCredits: accounting.knownCredits,
     lastModelAt: last?.time ?? null, lastModelStatus: last?.status ?? null,
     lastToolDecision: last?.output?.kind === 'tool_call' ? last.output.name ?? null :
       last?.output?.kind === 'tool_calls' ? last.output.calls?.map(call => call.name).join(', ') ?? null : null,
@@ -111,6 +117,9 @@ console.log(JSON.stringify({ ...output, ...(args.includes('--brief') ? {
   unknownCreditSessions: records.filter(row => row.credits === null).length,
   sessions: records.filter(row => row.running || row.sessionId === requestedSession).map(row => ({
     sessionId: row.sessionId, eventSeq: row.eventSeq, running: row.running, modelRequests: row.modelRequests,
+    bridgeRequests:row.bridgeRequests,upstreamModelRequestsKnown:row.upstreamModelRequestsKnown,
+    upstreamModelRequestCountUnknown:row.upstreamModelRequestCountUnknown,
+    correctionCalls:row.correctionCalls,recoveredRequests:row.recoveredRequests,
     errorCount: row.errorCount, pendingApprovalSeq: row.pendingApprovalSeq,
   })),
 } : { sessions: records }) }, null, 2));

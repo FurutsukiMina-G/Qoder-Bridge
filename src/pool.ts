@@ -9,9 +9,11 @@ import { type ChatRequest, type Decision, type DecisionRepair, conversationPromp
 import { hasConversationPrefix, routeConversation } from './routing.js';
 import { abortable } from './async.js';
 import { prefixCacheEstimate, withCachedTokens, ZERO_USAGE, type OpenAIUsage } from './usage.js';
+import {recoverDecision,decisionRetryLimit,decisionCorrectionPrompt,type RecoveryTrace} from './decision-recovery.js';
 
 export type InferHooks = { signal?: AbortSignal; onText?: (text: string) => void;
-  onThinking?: (text: string) => void; validateDecision?: (decision: Decision) => void };
+  onThinking?: (text: string) => void; validateDecision?: (decision: Decision) => void;
+  prepareDecisionRetry?: () => boolean };
 
 type Warm = Awaited<ReturnType<typeof startup>>;
 type RecordSession = {
@@ -23,6 +25,8 @@ type RecordSession = {
   policyCalls: Array<{ purpose: string; model: string; context_window: number | null; reasoning_effort: string | null }>;
   /** Prompt tokens of this Qoder session's latest completed model request: the next request's exact prefix. */
   lastPromptTokens: number | null;
+  lastFailedDecision: {hash:string;response:string;error:string;recovery:RecoveryTrace} | null;
+  lastCompletionId: string | null;
 };
 const MAX_SESSIONS = 8;
 const IDLE_MS = 60 * 60_000;
@@ -34,10 +38,14 @@ export class QoderPool {
   private nextWarm: Promise<RecordSession> | null = null;
   private openingByClient = new Map<string, Promise<RecordSession>>();
   private prewarmError: string | null = null;
+  private recoveredRequests = 0;
+  private exhaustedRequests = 0;
   // Idle SDK runtimes are otherwise released only when another session is opened.
   private sweeper = setInterval(() => this.sweepIdle(), SWEEP_MS);
   constructor(readonly config: Config) {
     this.sweeper.unref();
+    try { decisionRetryLimit(config.decisionRetries); }
+    catch(error) { clearInterval(this.sweeper); throw error; }
     if (config.sessionIdleMs !== undefined && (!Number.isSafeInteger(config.sessionIdleMs) || config.sessionIdleMs < 60_000)) {
       clearInterval(this.sweeper);
       throw new Error('sessionIdleMs must be an integer >=60000');
@@ -79,7 +87,8 @@ export class QoderPool {
       return { id: randomUUID(), warm, q, queue, controller, messages: [],
         touched: Date.now(), locked: Promise.resolve(), lastCredits: null, model: selected.model, busy: 0,
         toolSignature: null, retryHint: null, retryMessageHash: null, policyCalls,
-        closed: false, lastSuccessHash: null, lastDecision: null, sdkSessionId: null, lastPromptTokens: null };
+        closed: false, lastSuccessHash: null, lastDecision: null, sdkSessionId: null, lastPromptTokens: null,
+        lastFailedDecision:null,lastCompletionId:null };
     } catch (error) { queue.close(); warm?.close(); controller.abort(); throw error; }
   }
   private close(record: RecordSession) {
@@ -135,7 +144,9 @@ export class QoderPool {
   }
   bindTool(id: string, record: RecordSession) { this.byToolId.set(id, record.id); }
   stats() { return { sessions: this.sessions.size, busy: [...this.sessions.values()].filter(row => row.busy > 0).length,
-    opening: this.openingByClient.size, prewarmed: this.nextWarm !== null, prewarm_error: this.prewarmError }; }
+    opening: this.openingByClient.size, prewarmed: this.nextWarm !== null, prewarm_error: this.prewarmError,
+    decision_recovery:{max_correction_calls:decisionRetryLimit(this.config.decisionRetries),
+      recovered_requests:this.recoveredRequests,exhausted_requests:this.exhaustedRequests} }; }
   async infer(request: ChatRequest, hooks: InferHooks = {}) {
     const start = performance.now();
     const signal = AbortSignal.any([AbortSignal.timeout(this.config.timeout), ...(hooks.signal ? [hooks.signal] : [])]);
@@ -155,9 +166,30 @@ export class QoderPool {
         messages: request.messages, tools: request.tools, choice: request.tool_choice,
         temperature: request.temperature, max_tokens: request.max_tokens,
         max_completion_tokens: request.max_completion_tokens })).digest('hex');
+      // An exhausted identical request must not restart another paid retry loop
+      // just because an HTTP client retries the same body. A changed request
+      // (including an explicit new user message) can start a new decision.
+      if(record.lastFailedDecision?.hash===requestHash){
+        const failed=record.lastFailedDecision;
+        const localRecovery={...failed.recovery,correctionCalls:0,attempts:0,evidence:[],knownCreditsSubtotal:0,unknownCreditAttempts:0};
+        return {record,decision:null,decisionError:failed.error,response:failed.response,completionId:undefined,
+          recovery:localRecovery,report:{...new Telemetry().snapshot(),response:failed.response,
+            error:null as string|null,stage:'local_rejected_replay',model:record.model,
+            session_id:record.sdkSessionId,reused_session:true,startup_ms:0,prompt_chars:0,
+            available_tool_definition_chars:0,sent_tool_definition_chars:0,tool_definitions_reused:true,
+            tool_detail_mode:'reused',history_mode:'delta',sent_message_count:0,model_policy_calls:[],
+            client_session_key_present:Boolean(request.prompt_cache_key),client_session_key_hash:request.prompt_cache_key?createHash('sha256').update(request.prompt_cache_key).digest('hex').slice(0,12):null,
+            credits_delta:0,total_session_credits:record.lastCredits,model_requests:0,
+            local_response_replay:true,normalized_usage_source:'local_replay',client_usage:{...ZERO_USAGE} as OpenAIUsage|null,
+            client_cache_usage:'omitted',cache_estimate_tokens:null as number|null,cache_estimate_ratio:null as number|null,
+            decision_recovery:localRecovery,
+          }};
+      }
+      record.lastFailedDecision=null;
       if (record.lastSuccessHash === requestHash && record.lastDecision && Date.now() - record.touched < 120_000) {
         hooks.validateDecision?.(record.lastDecision);
         return { record, decision: record.lastDecision, decisionError: null, response: JSON.stringify(record.lastDecision),
+          completionId:record.lastCompletionId??undefined,
           report: { ...new Telemetry().snapshot(), session_id: record.sdkSessionId, model: record.model,
             response: JSON.stringify(record.lastDecision), error: null as string | null, stage: 'local_replay',
             reused_session: true, startup_ms: 0, prompt_chars: 0, available_tool_definition_chars: 0,
@@ -179,47 +211,68 @@ export class QoderPool {
       const prompt = `${record.retryHint ? `${record.retryHint}\n` : ''}${conversationPrompt({ ...request, messages: delta }, {
         omitUnchangedTools, historyMode: prefix ? 'delta' : 'full',
       })}`;
-      const telemetry = new Telemetry();
-      const policyStart = record.policyCalls.length;
-      let inferenceError: string | null = null;
       signal.addEventListener('abort', abort, { once: true });
-      try {
-        signal.throwIfAborted();
-        record.queue.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: prompt } });
-        while (true) {
-          const step = await abortable(record.q.next(), signal);
-          if (step.done) throw new Error('Qoder stream closed');
-          telemetry.observe(step.value, hooks.onText, hooks.onThinking);
-          if (step.value.type === 'result') break;
-        }
-        if (telemetry.result?.subtype !== 'success' || telemetry.result.is_error)
-          throw new Error(`Qoder result: ${telemetry.result?.subtype ?? 'missing'}`);
-      } catch (error) {
-        inferenceError = safeError(error);
-        this.close(record);
+      const attemptReports:Array<Record<string,unknown>>=[];
+      const recovered=await recoverDecision({request,prompt,retries:this.config.decisionRetries,signal,
+        prepareRetry:hooks.prepareDecisionRetry,validateDecision:hooks.validateDecision,
+        invoke:async(attemptPrompt,attempt,correctionSchemaCharacters)=>{
+          const telemetry = new Telemetry();
+          const policyStart = record.policyCalls.length;
+          let inferenceError: string | null = null;
+          try {
+            signal.throwIfAborted();
+            record.queue.push({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: attemptPrompt } });
+            while (true) {
+              const step = await abortable(record.q.next(), signal);
+              if (step.done) throw new Error('Qoder stream closed');
+              telemetry.observe(step.value, hooks.onText, hooks.onThinking);
+              if (step.value.type === 'result') break;
+            }
+            if (telemetry.result?.subtype !== 'success' || telemetry.result.is_error)
+              throw new Error(`Qoder result: ${telemetry.result?.subtype ?? 'missing'}`);
+          } catch (error) {
+            inferenceError = safeError(error);
+            this.close(record);
+          }
+          record.touched = Date.now();
+          const turnPolicies = record.policyCalls.slice(policyStart);
+          const windows = new Set(turnPolicies.map(call => call.context_window));
+          const report = telemetry.snapshot(windows.size === 1 ? [...windows][0]! : null);
+          const measured = report.normalized_usage_source === 'qoder_context_ratio+stream_token_deltas' ? report.normalized_usage : null;
+          const cacheEstimate = measured ? prefixCacheEstimate(measured.prompt_tokens, record.lastPromptTokens) : null;
+          const clientUsage = measured && cacheEstimate !== null && this.config.cacheUsage === 'estimate'
+            ? withCachedTokens(measured, cacheEstimate) : report.normalized_usage;
+          // The Qoder session appends every completed request, including one whose decision is later rejected.
+          if (!inferenceError) record.lastPromptTokens = report.normalized_usage?.prompt_tokens ?? null;
+          record.sdkSessionId = report.session_id ?? record.sdkSessionId;
+          const deltaCredits = report.total_session_credits === null ? report.credits :
+            report.total_session_credits - (record.lastCredits ?? 0);
+          if (report.total_session_credits !== null) record.lastCredits = report.total_session_credits;
+          else if (report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
+          const attemptReport={...report,response:telemetry.text,error:inferenceError,
+            stage:signal.aborted?'cancelled_or_timeout':'inference',model:record.model,reused_session:attempt>0||reused,
+            startup_ms:attempt>0||reused?0:performance.now()-start-report.wall_ms,
+            prompt_chars:attemptPrompt.length,available_tool_definition_chars:toolSignature.length,
+            sent_tool_definition_chars:attempt>0?correctionSchemaCharacters:omitUnchangedTools?0:JSON.stringify(toolDefinitions(request)).length,
+            tool_detail_mode:attempt>0?'correction_subset':omitUnchangedTools?'reused':'compact',tool_definitions_reused:omitUnchangedTools,
+            client_session_key_present:Boolean(request.prompt_cache_key),
+            client_session_key_hash:request.prompt_cache_key?createHash('sha256').update(request.prompt_cache_key).digest('hex').slice(0,12):null,
+            model_policy_calls:turnPolicies,decision_repairs:[] as DecisionRepair[],
+            history_mode:prefix?'delta':'full',sent_message_count:attempt>0?0:delta.length,
+            credits_delta:deltaCredits,credits_delta_source:report.total_session_credits!==null?'cumulative_delta':report.request_credits_source,
+            local_response_replay:false,client_usage:clientUsage,cache_estimate_tokens:cacheEstimate,
+            cache_estimate_ratio:cacheEstimate!==null&&measured&&measured.prompt_tokens>0?cacheEstimate/measured.prompt_tokens:null,
+            client_cache_usage:clientUsage?.prompt_tokens_details?(measured?'session_prefix_estimate':'reported'):'omitted'};
+          attemptReports.push(attemptReport);
+          return attemptReport;
+      }});
+      const {decision,decisionError,recovery}=recovered;
+      const turn=recovered.turn;
+      if(recovery.outcome==='recovered')this.recoveredRequests++;
+      if(['exhausted','repeated_invalid_decision'].includes(recovery.outcome)){
+        this.exhaustedRequests++;
+        record.lastFailedDecision={hash:requestHash,response:turn.response,error:decisionError!,recovery};
       }
-      record.touched = Date.now();
-      const turnPolicies = record.policyCalls.slice(policyStart);
-      const windows = new Set(turnPolicies.map(call => call.context_window));
-      const report = telemetry.snapshot(windows.size === 1 ? [...windows][0]! : null);
-      const measured = report.normalized_usage_source === 'qoder_context_ratio+stream_token_deltas' ? report.normalized_usage : null;
-      const cacheEstimate = measured ? prefixCacheEstimate(measured.prompt_tokens, record.lastPromptTokens) : null;
-      const clientUsage = measured && cacheEstimate !== null && this.config.cacheUsage === 'estimate'
-        ? withCachedTokens(measured, cacheEstimate) : report.normalized_usage;
-      // The Qoder session appends every completed request, including one whose decision is later rejected.
-      if (!inferenceError) record.lastPromptTokens = report.normalized_usage?.prompt_tokens ?? null;
-      record.sdkSessionId = report.session_id ?? record.sdkSessionId;
-      const deltaCredits = report.total_session_credits === null ? report.credits :
-        report.total_session_credits - (record.lastCredits ?? 0);
-      if (report.total_session_credits !== null) record.lastCredits = report.total_session_credits;
-      else if (report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
-      let decision: ReturnType<typeof parseDecision> | null = null;
-      let decisionError: string | null = null;
-      const decisionRepairs: DecisionRepair[] = [];
-      if (!inferenceError) try {
-        decision = parseDecision(telemetry.text, request, repair => decisionRepairs.push(repair));
-        hooks.validateDecision?.(decision);
-      } catch (error) { decisionError = safeError(error); decision = null; }
       if (decision) {
         record.messages = request.messages;
         record.toolSignature = toolSignature;
@@ -227,30 +280,32 @@ export class QoderPool {
         record.retryMessageHash = null;
         record.lastSuccessHash = requestHash;
         record.lastDecision = decision;
-      } else if (!inferenceError) {
-        record.retryHint = `The preceding model decision was rejected: ${decisionError?.slice(0, 180)}. ` +
-          'Retry the same Harness request with a valid final answer or tool call. Every call needs a name and arguments; do not assume any tool ran.' +
-          (/(?:^|\.)name:|Unknown or unselected tool name/.test(decisionError ?? '')
-            ? ` Allowed tool names: ${(request.tools ?? []).map(tool => tool.function.name).join(', ').slice(0, 350)}.` : '');
+        record.lastCompletionId=randomUUID();
+      } else if (!turn.error) {
+        record.retryHint = `The preceding model decision was rejected. ${decisionCorrectionPrompt(request,decisionError!,turn.response)}`;
         record.retryMessageHash = requestHash;
       }
-      return { record, decision, decisionError, response: telemetry.text, report: { ...report, response: telemetry.text,
-        error: inferenceError, stage: signal.aborted ? 'cancelled_or_timeout' : 'inference', model: record.model, reused_session: reused,
-        startup_ms: reused ? 0 : performance.now() - start - report.wall_ms,
-        prompt_chars: prompt.length, available_tool_definition_chars: toolSignature.length,
-        sent_tool_definition_chars: omitUnchangedTools ? 0 : JSON.stringify(toolDefinitions(request)).length,
-        tool_detail_mode: omitUnchangedTools ? 'reused' : 'compact',
-        tool_definitions_reused: omitUnchangedTools,
-        client_session_key_present: Boolean(request.prompt_cache_key),
-        client_session_key_hash: request.prompt_cache_key ?
-          createHash('sha256').update(request.prompt_cache_key).digest('hex').slice(0, 12) : null,
-        model_policy_calls: turnPolicies, decision_repairs: decisionRepairs,
-        history_mode: prefix ? 'delta' : 'full', sent_message_count: delta.length,
-        credits_delta: deltaCredits, credits_delta_source: report.total_session_credits !== null ? 'cumulative_delta' : report.request_credits_source,
-        local_response_replay: false, client_usage: clientUsage, cache_estimate_tokens: cacheEstimate,
-        cache_estimate_ratio: cacheEstimate !== null && measured && measured.prompt_tokens > 0
-          ? cacheEstimate / measured.prompt_tokens : null,
-        client_cache_usage: clientUsage?.prompt_tokens_details ? (measured ? 'session_prefix_estimate' : 'reported') : 'omitted' } };
+      return {record,decision,decisionError,response:turn.response,recovery,completionId:record.lastCompletionId??undefined,report:{...turn,reused_session:reused,
+        history_mode:prefix?'delta':'full',sent_message_count:delta.length,
+        wall_ms:performance.now()-start,
+        credits_delta_source:recovery.attempts>1?'sum_of_decision_attempts':turn.credits_delta_source,
+        sent_tool_definition_chars:attemptReports.reduce((n,r)=>n+(r.sent_tool_definition_chars as number),0),
+        model_policy_calls:attemptReports.flatMap(r=>r.model_policy_calls as unknown[]),
+        requests:attemptReports.flatMap(r=>r.requests as unknown[]),
+        api_retries:attemptReports.reduce((n,r)=>n+(r.api_retries as number),0),
+        api_retry_details:attemptReports.flatMap(r=>r.api_retry_details as unknown[]),
+        api_error_categories:attemptReports.flatMap(r=>r.api_error_categories as string[]),
+        stream_stop_reasons:[...new Set(attemptReports.flatMap(r=>r.stream_stop_reasons as string[]))],
+        sdk_errors:attemptReports.flatMap(r=>r.sdk_errors as string[]),
+        model_queue_statuses:attemptReports.flatMap(r=>r.model_queue_statuses as unknown[]),
+        stream_usage_snapshots:attemptReports.flatMap(r=>r.stream_usage_snapshots as unknown[]),
+        stream_token_counts:attemptReports.flatMap(r=>r.stream_token_counts as unknown[]),
+        text_delta_count:attemptReports.reduce((n,r)=>n+(r.text_delta_count as number),0),
+        thinking_delta_count:attemptReports.reduce((n,r)=>n+(r.thinking_delta_count as number),0),
+        thinking_chars:attemptReports.reduce((n,r)=>n+(r.thinking_chars as number),0),
+        ttft_ms:attemptReports[0]!.ttft_ms as number|null,
+        first_event_ms:attemptReports[0]!.first_event_ms as number|null,
+        decision_recovery:recovery}};
     } finally {
       signal.removeEventListener('abort', abort);
       record.busy--;

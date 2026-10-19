@@ -9,6 +9,12 @@ export class FinalTextProjector {
   private decoded = '';
   emitted = '';
   constructor(private readonly send: (text: string) => void) {}
+  /** A rejected tool decision was never published; discard only its private parser buffer. */
+  resetUncommitted() {
+    if (this.emitted) return false;
+    this.source = ''; this.at = null; this.closed = false; this.broken = false; this.decoded = '';
+    return true;
+  }
   push(delta: string) {
     this.source += delta;
     if (this.broken || this.closed) return;

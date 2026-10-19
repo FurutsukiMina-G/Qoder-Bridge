@@ -16,6 +16,8 @@ export interface Config extends Selection {
   cacheUsage?: 'none' | 'estimate';
   /** Retain idle conversation context through human approval waits; bounded by pool capacity. */
   sessionIdleMs?: number;
+  /** Regenerate rejected decisions inside one request; never retry runtime/permission/budget failures. */
+  decisionRetries?: number;
 }
 export function baseOptions(config: Config, controller: AbortController): Options {
   return {

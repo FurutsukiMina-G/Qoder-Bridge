@@ -5,7 +5,7 @@ import { ChatRequest } from '../src/compat.js';
 import type { Config } from '../src/client.js';
 
 test('a rejected model decision keeps the Harness message pending for the next retry', async () => {
-  const config: Config = { auth: 'cli', timeout: 30000, strategy: 'permission', system: 'test' };
+  const config: Config = { auth: 'cli', timeout: 30000, strategy: 'permission', system: 'test',decisionRetries:0 };
   const request = ChatRequest.parse({ model: 'qoder-deepseek-flash', prompt_cache_key: 'session-test',
     messages: [{ role: 'user', content: 'Read the fixture' }],
     tools: [{ type: 'function', function: { name: 'read_file', parameters: {
