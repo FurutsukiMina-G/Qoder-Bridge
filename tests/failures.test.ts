@@ -118,19 +118,26 @@ test('preflight errors have IDs and identify the local Bridge key rather than up
 test('client disconnect is logged without blaming DSH, while the Bridge deadline is returned in SSE', async () => {
   const dir=await mkdtemp(join(tmpdir(),'qoderbridge-disconnect-'));
   const fake=(async()=>{await new Promise(resolve=>setTimeout(resolve,100));return {response:'',error:'aborted',stage:'inference'};}) as unknown as typeof runProbe;
-  const server=await createBridgeServer({auth:'cli',timeout:50,strategy:'permission',system:'fixture'},
+  const serve=(timeout:number)=>createBridgeServer({auth:'cli',timeout,strategy:'permission',system:'fixture'},
     {port:0,key:'test',reportDir:dir,infer:fake});
-  const url=`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`;
+  // Separate deadlines: on a busy host a 50 ms deadline can win the race against the client's cancel.
+  const [disconnecting,expiring]=await Promise.all([serve(5000),serve(50)]);
+  const url=(server:typeof disconnecting)=>`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`;
   const init={method:'POST',headers:{authorization:'Bearer test','content-type':'application/json'},
     body:JSON.stringify({model:'qoder-deepseek-flash',stream:true,messages:[{role:'user',content:'fixture'}]})};
   try {
-    const first=await fetch(url,init); const reader=first.body!.getReader(); await reader.read(); await reader.cancel();
-    await new Promise(resolve=>setTimeout(resolve,150));
-    const rows=(await readFile(join(dir,'errors.ndjson'),'utf8')).trim().split('\n').map(s=>JSON.parse(s));
+    const first=await fetch(url(disconnecting),init); const reader=first.body!.getReader(); await reader.read(); await reader.cancel();
+    // The cancelled request finishes in the background; poll for its row instead of racing a fixed sleep.
+    let log='';
+    for (const until=Date.now()+5000; !log.endsWith('\n')&&Date.now()<until;) {
+      await new Promise(resolve=>setTimeout(resolve,25));
+      log=await readFile(join(dir,'errors.ndjson'),'utf8').catch(()=>'');
+    }
+    const rows=log.trim().split('\n').map(s=>JSON.parse(s));
     assert.equal(rows[0].error.code,'client_disconnected'); assert.equal(rows[0].error.origin,'connection');
-    const response=await fetch(url,init); const raw=await response.text();
+    const response=await fetch(url(expiring),init); const raw=await response.text();
     assert.match(raw,/bridge_request_timeout/); assert.match(raw,/Bridge/); assert.doesNotMatch(raw,/\[DONE\]/);
-  } finally {await new Promise<void>(resolve=>server.close(()=>resolve()));}
+  } finally {await Promise.all([disconnecting,expiring].map(server=>new Promise<void>(resolve=>server.close(()=>resolve()))));}
 });
 test('a local report write failure is identified as Bridge rather than model output', async () => {
   const dir=await mkdtemp(join(tmpdir(),'qoderbridge-report-failure-')); const file=join(dir,'not-a-directory');
