@@ -41,7 +41,7 @@ function correction(request: ChatRequest, error: string, response: string) {
   const names = new Set<string>();
   const explicitErrorTool = /^Arguments for ([\w.-]+) violate/.exec(error)?.[1];
   if (explicitErrorTool) names.add(explicitErrorTool);
-  for (const match of response.matchAll(/(?:"name"\s*:\s*"|invoke\s+name=")([\w.-]+)"/g)) names.add(match[1]!);
+  for (const match of response.matchAll(/(?:"name"\s*:\s*"|invoke\s+name="|<name=")([\w.-]+)"/g)) names.add(match[1]!);
   const definitions = toolDefinitions(request).filter(tool => names.has(tool.name));
   const contract = {validation_error:error.slice(0,500),tool_choice:request.tool_choice??'auto',
     allowed_tool_names:(request.tools??[]).map(tool=>tool.function.name),

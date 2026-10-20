@@ -1,4 +1,5 @@
 import type { Decision } from './compat.js';
+import {isLeakedFinalProtocol,mayStartToolProtocol} from './protocol-text.js';
 
 /** Project only the unambiguous final.content JSON string. Tool decisions stay buffered. */
 export class FinalTextProjector {
@@ -41,12 +42,16 @@ export class FinalTextProjector {
       }
     }
     let text = this.decoded;
+    // Do not leak a call envelope that the model incorrectly wrapped in final.content.
+    if (!this.emitted && (isLeakedFinalProtocol(text) || (!this.closed && mayStartToolProtocol(text)))) return;
     // Never split a UTF-16 surrogate pair across transport chunks.
     if (!this.closed && /[\uD800-\uDBFF]$/.test(text)) text = text.slice(0, -1);
     const next = text.slice(this.emitted.length);
     if (next) { this.send(next); this.emitted = text; }
   }
   validate(decision: Decision) {
+    if (decision.kind === 'final' && isLeakedFinalProtocol(decision.content))
+      throw new Error('Tool protocol was returned as final text');
     if (this.emitted && (decision.kind !== 'final' || !decision.content.startsWith(this.emitted)))
       throw new Error('Streamed answer does not match the validated model decision');
   }

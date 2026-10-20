@@ -35,6 +35,7 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   billing_tier?: string | null; requested_reasoning?: string | null;
   reasoning_guard?: { limit: number; reasoning_tokens: number; stopped: boolean } | null; reasoning_guard_stops?: number;
   upstream_failure?: {code:string;message:string}|null;
+  context_reset?:unknown;prompt_optimization?:{contract_reused:boolean;echo_characters_avoided:number};
   failure?: ReturnType<typeof bridgeFailure> | null;
   sdk_error_code?: number | string | null; sdk_exception?: SDKExceptionDetails | null;
 };
@@ -104,6 +105,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       billing_tier: turn?.billing_tier ?? null, requested_reasoning: turn?.requested_reasoning ?? null,
       reasoning_guard: turn?.reasoning_guard ?? null, reasoning_guard_stops: turn?.reasoning_guard_stops ?? 0,
       tool_definitions_reused: turn?.tool_definitions_reused ?? null },
-    context_transport: { history_mode: turn?.history_mode ?? null, sent_message_count: turn?.sent_message_count ?? null },
+    context_transport: { history_mode: turn?.history_mode ?? null, sent_message_count: turn?.sent_message_count ?? null,
+      reset:turn?.context_reset??null,optimization:turn?.prompt_optimization??null },
   };
 }

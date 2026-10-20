@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { diagnosticToolName } from './diagnostics.js';
 import {toolValidator} from './tool-contract.js';
+import {isToolProtocolText,isLeakedFinalProtocol} from './protocol-text.js';
 
 const Message = z.object({ role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
   content: z.unknown().optional(), tool_calls: z.array(z.unknown()).optional(),
@@ -832,7 +833,7 @@ function jsonDecision(text: string, request: ChatRequest, repairs: DecisionRepai
     // A plain assistant reply is a valid final answer. Never reinterpret a malformed
     // structured tool decision as prose, since that could hide an intended tool call.
     if (text && !text.startsWith('{') && !text.startsWith('[') &&
-      !/｜｜(?:DSML|DS)｜｜/.test(text) && !/<\/?custom_tool_call\b/.test(text) && !/"kind"\s*:/.test(text))
+      !/｜｜(?:DSML|DS)｜｜/.test(text) && !/<\/?custom_tool_call\b/.test(text) && !isToolProtocolText(text) && !/"kind"\s*:/.test(text))
       return { kind: 'final', content: text };
     throw original;
   }
@@ -842,6 +843,10 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/.exec(trimmed);
   const source = fenced?.[1] ?? trimmed;
+  // An unsupported call block owns its embedded JSON. Never salvage a nested final/call
+  // from inside a rejected batch, even if one argument contains a valid-looking decision.
+  if (!/^[{[]/.test(source) && /(?:^|\n)[\t ]*<\/?system_call\b/i.test(source))
+    throw new Error('Unsupported system_call tool envelope; regenerate the complete decision as JSON');
   // This observed alternate marker is not a supported envelope. Reject it
   // before a partial call or plain-text final can hide unexecuted tool intent.
   // A leading JSON object/array owns its strings, including markup examples.
@@ -871,6 +876,7 @@ export function parseDecision(text: string, request: ChatRequest, onRepair?: (re
   const selected = typeof request.tool_choice === 'object' && request.tool_choice !== null &&
     'function' in request.tool_choice ? (request.tool_choice.function as { name?: unknown })?.name : undefined;
   if (decision.kind === 'final') {
+    if (isLeakedFinalProtocol(decision.content)) throw new Error('Tool protocol was returned as final text; regenerate a valid tool decision or a readable natural-language reply');
     if (request.tool_choice === 'required' || typeof selected === 'string') throw new Error('tool_choice requires a tool call');
     return decision;
   }
@@ -907,6 +913,34 @@ function contentText(content: unknown): string {
 export function assertTextRequest(request: ChatRequest) {
   for (const message of request.messages) contentText(message.content);
 }
+/** The exact semantic message representation delivered to the decision model. Transport/thinking metadata is not replayed. */
+export function conversationMessages(messages: ChatRequest['messages']) {
+  return messages.map(m => ({ role: m.role, content: contentText(m.content),
+    ...(m.name ? { name: m.name } : {}),
+    ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+    ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+  }));
+}
+function priorToolEcho(message: ReturnType<typeof conversationMessages>[number], prior: Decision | undefined) {
+  if (message.role !== 'assistant' || message.content || !prior || prior.kind === 'final') return null;
+  const calls = prior.kind === 'tool_call' ? [prior] : prior.calls;
+  if (message.tool_calls?.length !== calls.length) return null;
+  const ids: Array<{id:string;name:string;arguments_sha256:string}> = [];
+  for (let i=0;i<calls.length;i++) {
+    const actual = message.tool_calls[i] as {id?:unknown;type?:unknown;function?:{name?:unknown;arguments?:unknown}};
+    const expected = calls[i]!;
+    if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return null;
+    if (Object.keys(actual).some(key=>!['id','type','function'].includes(key)) ||
+      Object.keys(actual.function??{}).some(key=>!['name','arguments'].includes(key))) return null;
+    if (actual.type !== 'function' || typeof actual.id !== 'string' || actual.function?.name !== expected.name ||
+      typeof actual.function.arguments !== 'string') return null;
+    let args:unknown; try { args=JSON.parse(actual.function.arguments); } catch { return null; }
+    if (!isDeepStrictEqual(args, expected.arguments)) return null;
+    ids.push({id:actual.id,name:expected.name,arguments_sha256:createHash('sha256').update(actual.function.arguments).digest('hex')});
+  }
+  return { role:'assistant',content:'Host assigned these IDs to your immediately preceding validated tool decision. '+
+    'The complete arguments are unchanged and already in this session; execution status is only in the following tool results.',prior_decision_calls:ids };
+}
 function shorten(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const candidate = text.slice(0, limit);
@@ -928,29 +962,40 @@ export function toolDefinitions(request: ChatRequest, full = false) {
 }
 export function conversationPrompt(request: ChatRequest, options: {
   omitUnchangedTools?: boolean; historyMode?: 'full' | 'delta'; fullToolDetails?: boolean;
+  priorDecision?: Decision;
+  onOptimization?: (value:{contract_reused:boolean;echo_characters_avoided:number})=>void;
 } = {}): string {
   const messages = request.messages;
-  const transcript = messages.map(m => ({ role: m.role, content: contentText(m.content),
-    ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-    ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-  }));
-  const tools = toolDefinitions(request, options.fullToolDetails);
+  const transcript: unknown[] = conversationMessages(messages);
+  let echoCharactersAvoided=0;
+  if (options.historyMode === 'delta' && transcript.length) {
+    const echo=priorToolEcho(transcript[0] as ReturnType<typeof conversationMessages>[number],options.priorDecision);
+    if (echo && JSON.stringify(echo).length < JSON.stringify(transcript[0]).length) {
+      echoCharactersAvoided=JSON.stringify(transcript[0]).length-JSON.stringify(echo).length;
+      transcript[0]=echo;
+    }
+  }
   const toolBlock = options.omitUnchangedTools
     ? `Tool definitions are unchanged from the previous turn in this Qoder session. Use those exact names and schemas.\n`
-    : `Tools (JSON schemas): ${JSON.stringify(tools)}\n`;
-  return `You are the model decision layer for DeepSeek Harness. The Harness itself owns and executes all tools.\n` +
+    : `Tools (JSON schemas): ${JSON.stringify(toolDefinitions(request,options.fullToolDetails))}\n`;
+  options.onOptimization?.({contract_reused:options.historyMode==='delta',echo_characters_avoided:echoCharactersAvoided});
+  const contract = options.historyMode === 'delta'
+    ? 'Continue the same Harness task under the existing decision contract. Return exactly one JSON decision; host tools and approvals remain with Harness.\n'
+    : `You are the model decision layer for DeepSeek Harness. The Harness itself owns and executes all tools.\n` +
     `Return exactly one JSON object, with no markdown:\n` +
     `{"kind":"final","content":"your response"}\n` +
     `or {"kind":"tool_call","name":"one provided tool name","arguments":{...}}\n` +
     `For independent parallel actions, you may use {"kind":"tool_calls","calls":[{"name":"provided tool name","arguments":{...}}]}.\n` +
     `Choose a tool when the user task needs a file, command, search, or other host action.\n` +
     `Do not return a progress-only final answer while host actions remain necessary.\n` +
+    `When asking the user, use a declared question tool with its real schema, or a readable natural-language final reply. Never expose tool protocol as an answer.\n` +
     `For long write/edit content, issue one tool call at a time instead of batching large file edits. ` +
     `For edit, use the smallest unambiguous matching old_string instead of copying a whole file.\n` +
     `Protocol check before sending: use JSON only, never DSML/XML or positional argument arrays. ` +
     `Every required field must be present; use the schema's actual types (numbers are not quoted). ` +
     `For read use named file_path/offset/limit when declared; for edit include complete old_string AND new_string; ` +
-    `for pwsh include its required description AND command. Finish every string/object before ending the response.\n` +
+    `for pwsh include its required description AND command. Finish every string/object before ending the response.\n`;
+  return contract +
     `Tool choice: ${JSON.stringify(request.tool_choice ?? 'auto')}\n` +
     toolBlock +
     `Conversation (${options.historyMode === 'delta' ? 'new messages since the prior decision' : 'full history'}): ${JSON.stringify(transcript)}\n` +

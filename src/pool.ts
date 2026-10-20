@@ -5,8 +5,8 @@ import { baseOptions, isolateSession, type Config } from './client.js';
 import { InputQueue } from './queue.js';
 import { selectModel } from './model.js';
 import { Telemetry, safeError } from './telemetry.js';
-import { type ChatRequest, type Decision, type DecisionRepair, conversationPrompt, parseDecision, toolDefinitions } from './compat.js';
-import { hasConversationPrefix, routeConversation } from './routing.js';
+import { type ChatRequest, type Decision, type DecisionRepair, conversationPrompt, conversationMessages, parseDecision, toolDefinitions } from './compat.js';
+import { hasConversationPrefix, routeConversation, prefixIssue } from './routing.js';
 import { abortable } from './async.js';
 import { prefixCacheEstimate, withCachedTokens, ZERO_USAGE, type OpenAIUsage } from './usage.js';
 import {recoverDecision,decisionRetryLimit,decisionCorrectionPrompt,type RecoveryTrace} from './decision-recovery.js';
@@ -139,9 +139,11 @@ export class QoderPool {
     const key = request.prompt_cache_key;
     const opening = key ? this.openingByClient.get(key) : undefined;
     if (opening) return { record: await opening, reused: true };
+    const prior=key?this.sessions.get(this.byClientSession.get(key)??''):undefined;
+    const contextReset=prior?prefixIssue(prior.messages,request.messages):null;
     const created = this.acquireNew(request);
     if (key) this.openingByClient.set(key, created);
-    try { return { record: await created, reused: false }; }
+    try { return { record: await created, reused: false, contextReset }; }
     finally { if (key && this.openingByClient.get(key) === created) this.openingByClient.delete(key); }
   }
   private async acquireNew(request: ChatRequest) {
@@ -171,7 +173,8 @@ export class QoderPool {
   async infer(request: ChatRequest, hooks: InferHooks = {}) {
     const start = performance.now();
     const signal = AbortSignal.any([AbortSignal.timeout(this.config.timeout), ...(hooks.signal ? [hooks.signal] : [])]);
-    const { record, reused } = await abortable(this.acquire(request), signal);
+    const acquired=await abortable(this.acquire(request), signal);
+    const { record, reused } = acquired;
     record.busy++;
     let unlock!: () => void;
     const previous = record.locked;
@@ -184,7 +187,7 @@ export class QoderPool {
       signal.throwIfAborted();
       if (record.closed) throw new Error('Qoder session closed before this queued request');
       const requestHash = createHash('sha256').update(JSON.stringify({ model: request.model,
-        messages: request.messages, tools: request.tools, choice: request.tool_choice,
+        messages: conversationMessages(request.messages), tools: request.tools, choice: request.tool_choice,
         temperature: request.temperature, max_tokens: request.max_tokens,
         max_completion_tokens: request.max_completion_tokens, reasoning: hooks.reasoningEffort ?? null })).digest('hex');
       // An exhausted identical request must not restart another paid retry loop
@@ -229,8 +232,10 @@ export class QoderPool {
       const toolSignature = JSON.stringify(request.tools ?? []);
       const omitUnchangedTools = reused && record.toolSignature === toolSignature;
       if (record.retryMessageHash !== requestHash) { record.retryHint = null; record.retryMessageHash = null; }
+      let optimization:{contract_reused:boolean;echo_characters_avoided:number}|undefined;
       const prompt = `${record.retryHint ? `${record.retryHint}\n` : ''}${conversationPrompt({ ...request, messages: delta }, {
-        omitUnchangedTools, historyMode: prefix ? 'delta' : 'full',
+        omitUnchangedTools, historyMode: prefix ? 'delta' : 'full', priorDecision: prefix ? record.lastDecision ?? undefined : undefined,
+        onOptimization:value=>{optimization=value},
       })}`;
       signal.addEventListener('abort', abort, { once: true });
       const attemptReports:Array<Record<string,unknown>>=[];
@@ -346,6 +351,7 @@ export class QoderPool {
         record.retryMessageHash = requestHash;
       }
       return {record,decision,decisionError,response:turn.response,recovery,completionId:record.lastCompletionId??undefined,report:{...turn,reused_session:reused,
+        context_reset:'contextReset' in acquired?acquired.contextReset:null,prompt_optimization:optimization,
         history_mode:prefix?'delta':'full',sent_message_count:delta.length,
         wall_ms:performance.now()-start,
         credits_delta_source:recovery.attempts>1?'sum_of_decision_attempts':turn.credits_delta_source,
