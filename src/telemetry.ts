@@ -180,6 +180,9 @@ export class Telemetry {
       context_window: contextWindow,
       context_usage_ratio: streams.at(-1)?.contextRatio ?? (typeof resultRatio === 'number' ? resultRatio : null),
       stream_token_counts: streams.map(row => ({ ...row, reliable: tokenDeltasReliable(row) })),
+      streamed_token_deltas_reliable: !this.unstreamedText && streams.length>0 && streams.every(tokenDeltasReliable),
+      streamed_output_tokens: this.textDeltaCount+this.thinkingDeltaCount,
+      streamed_reasoning_tokens: this.thinkingDeltaCount,
       reasoning_tokens: usage?.completion_tokens_details?.reasoning_tokens ?? null,
       // Bridge-observed decode rate: output tokens over first-delta to last-delta time, like Harness tok/s.
       output_tokens_per_second: usage && decodeMs && decodeMs > 0 && usage.completion_tokens > 1

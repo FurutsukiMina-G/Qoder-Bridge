@@ -79,6 +79,36 @@ export function withCachedTokens(usage: OpenAIUsage, cached: number): OpenAIUsag
 }
 export const ZERO_USAGE: Readonly<OpenAIUsage> = Object.freeze({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
 
+/** Per-dimension coverage: an unknown input must not erase observed output or become a zero input. */
+export type UsageAccounting={attempts:number;prompt_tokens:number|null;completion_tokens:number|null;reasoning_tokens:number|null;
+  known_prompt_tokens:number;known_completion_tokens:number;known_reasoning_tokens:number;
+  unknown_prompt_attempts:number;unknown_completion_attempts:number;unknown_reasoning_attempts:number;sources:string[]};
+export function sumUsageAccounting(rows:UsageAccounting[]):UsageAccounting{
+  const sum=(key:keyof UsageAccounting)=>rows.reduce((n,row)=>n+(row[key] as number),0);
+  const prompt=sum('known_prompt_tokens'),output=sum('known_completion_tokens'),reasoning=sum('known_reasoning_tokens');
+  const up=sum('unknown_prompt_attempts'),uo=sum('unknown_completion_attempts'),ur=sum('unknown_reasoning_attempts');
+  return{attempts:sum('attempts'),prompt_tokens:up?null:prompt,completion_tokens:uo?null:output,reasoning_tokens:ur?null:reasoning,
+    known_prompt_tokens:prompt,known_completion_tokens:output,known_reasoning_tokens:reasoning,
+    unknown_prompt_attempts:up,unknown_completion_attempts:uo,unknown_reasoning_attempts:ur,
+    sources:[...new Set(rows.flatMap(row=>row.sources))]};
+}
+export function usageAccounting(values:Array<{usage?:OpenAIUsage|null;source?:string;streamedOutputTokens?:number;
+  streamedReasoningTokens?:number;streamedReliable?:boolean}>):UsageAccounting{
+  return sumUsageAccounting(values.map(value=>{
+    const prompt=value.usage?.prompt_tokens,output=value.usage?.completion_tokens,reasoning=value.usage?.completion_tokens_details?.reasoning_tokens;
+    const partial=value.streamedReliable===true&&count(value.streamedOutputTokens);
+    const out=count(output)?output:partial?value.streamedOutputTokens!:null;
+    const reportedReasoning=count(reasoning)&&out!==null&&reasoning<=out;
+    const streamedReasoning=partial&&out!==null&&count(value.streamedReasoningTokens)&&
+      value.streamedReasoningTokens<=value.streamedOutputTokens!&&value.streamedReasoningTokens<=out;
+    const think=reportedReasoning?reasoning!:streamedReasoning?value.streamedReasoningTokens!:null;
+    return{attempts:1,prompt_tokens:count(prompt)?prompt:null,completion_tokens:out,reasoning_tokens:think,
+      known_prompt_tokens:count(prompt)?prompt:0,known_completion_tokens:out??0,known_reasoning_tokens:think??0,
+      unknown_prompt_attempts:count(prompt)?0:1,unknown_completion_attempts:out===null?1:0,unknown_reasoning_attempts:think===null?1:0,
+      sources:[...(value.usage?[value.source??'unspecified_usage']:[]),...((!count(output)&&partial||!reportedReasoning&&streamedReasoning)?['stream_token_deltas_partial']:[])]};
+  }));
+}
+
 /** Sum actual attempt usage; a missing attempt must stay unknown rather than becoming zero. */
 export function sumOpenAIUsage(values: Array<OpenAIUsage | null | undefined>): OpenAIUsage | null {
   if (!values.length || values.some(value => !value)) return null;

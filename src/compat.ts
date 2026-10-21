@@ -37,7 +37,7 @@ export type DecisionRepair = { kind: 'misclosed_parameter' | 'shorthand_paramete
   'tool_calls_envelope' | 'flat_call_arguments' | 'decorated_calls_envelope' | 'attribute_parameters' |
   'terminal_field_stub' | 'custom_tool_envelope' | 'localized_parameter' | 'generic_arguments_boundary' |
   'attributed_call_envelope' | 'named_generic_wrapper' | 'plain_tool_envelope' | 'redundant_decision_closers' | 'missing_calls_opener' |
-  'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters'; tool: string; parameter: string };
+  'missing_calls_parameter_wrapper' | 'generic_shorthand_name' | 'plain_write_parameters' | 'misclosed_invoke_opener'; tool: string; parameter: string };
 function parseJson(text: string): unknown {
   try { return JSON.parse(text); }
   catch (original) {
@@ -386,11 +386,33 @@ function unwrappedCalls(tail: string, repairs: DecisionRepair[], request: ChatRe
   }
   return calls;
 }
+/** A named close can be an observed next-call opener only outside a fully closed preceding invocation. */
+function repairMisclosedInvokeOpeners(text:string,request:ChatRequest,repairs:DecisionRepair[]):string{
+  const outer=/^<｜｜DSML｜｜\s*(calls|tool_calls)>/.exec(text);if(!outer)return text;
+  let cursor=outer[0].length,priorCalls=0,out=text.slice(0,cursor);const changed:DecisionRepair[]=[];
+  while(cursor<text.length){
+    const spacing=/^\s*/.exec(text.slice(cursor))![0];out+=spacing;cursor+=spacing.length;
+    const tail=text.slice(cursor),close=new RegExp(`^<\\/｜｜DSML｜｜\\s*${outer[1]}>\\s*$`).exec(tail);
+    if(close){if(changed.length){repairs.push(...changed);return out+tail}return text;}
+    const open=/^<(\/?)｜｜DSML｜｜\s*invoke\s+name="([A-Za-z_][\w.-]*)">/.exec(tail);
+    if(!open)return text;
+    const name=open[2]!,provided=request.tools?.filter(t=>t.function.name===name)??[];
+    if(open[1]&&priorCalls&&provided.length!==1)throw new Error('Misclosed invocation names an unknown or ambiguous tool');
+    if(provided.length!==1||['tool_call','tool_calls'].includes(name)||open[1]&&!priorCalls)return text;
+    const body=tail.slice(open[0].length),end=invocationEnd(body);
+    if(end===null)return text;
+    out+=(open[1]?open[0].replace(/^<\//,'<'):open[0])+body.slice(0,end);
+    if(open[1])changed.push({kind:'misclosed_invoke_opener',tool:name,parameter:'call'});
+    cursor+=open[0].length+end;priorCalls++;
+  }
+  return text;
+}
 function dsmlDecision(text: string, request: ChatRequest, repairs: DecisionRepair[]): Decision | null {
   const marker = /<｜｜DSML｜｜\s*(calls|tool_calls)>/.exec(text);
   const markerAt = marker?.index ?? -1;
   if (markerAt < 0) return null;
   text = text.slice(markerAt);
+  text = repairMisclosedInvokeOpeners(text,request,repairs);
   // A repeated observed wrapper names the generic adapter first, then one
   // supplied native tool. Only a complete single call with one JSON object
   // is unambiguous; never pick between native tools or discard batch members.

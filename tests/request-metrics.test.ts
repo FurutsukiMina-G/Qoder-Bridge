@@ -12,3 +12,9 @@ test('request accounting distinguishes HTTP requests, correction calls and parti
   assert.equal(report.upstreamModelRequestCountUnknown,2);assert.equal(report.knownCredits,0.6000000000000001);
   assert.equal(report.unknownCreditRequests,1);assert.equal(report.correctionCalls,2);assert.equal(report.recoveredRequests,1);
 });
+test('a report does not count one correcting HTTP request as one model call or lose its known credit subtotal',()=>{
+  const rows=[{telemetry:{model_requests:2,credits_delta:0.4,decision_recovery:{knownCreditsSubtotal:0.4,correctionCalls:1}}},
+    {telemetry:{model_requests:null,credits_delta:null,decision_recovery:{knownCreditsSubtotal:0.2,correctionCalls:1}}}];
+  const value=requestAccounting(rows);assert.equal(value.bridgeRequests,2);assert.equal(value.upstreamModelRequestsKnown,2);
+  assert.equal(value.upstreamModelRequestCountUnknown,1);assert.equal(value.unknownCreditRequests,1);assert.ok(Math.abs(value.knownCredits-0.6)<1e-10);
+});

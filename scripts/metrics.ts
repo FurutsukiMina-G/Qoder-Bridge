@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import {requestAccounting,knownRequestCredits} from '../src/request-metrics.js';
+import {requestAccounting,knownRequestCredits,requestTokenAccounting} from '../src/request-metrics.js';
 const args = process.argv.slice(2);
 const value = (flag: string) => args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined;
 const limit = Number(value('--limit') ?? '20');
@@ -19,7 +19,6 @@ const p50 = (items: unknown[]) => {
   return values.length ? values[Math.floor(values.length / 2)] : null;
 };
 const reported = attempts.filter(row => row.telemetry?.usage != null);
-const tokens = (field: 'prompt_tokens' | 'completion_tokens') => reported.reduce((n, row) => n + row.telemetry.usage[field], 0);
 const cacheKnown = reported.filter(row => row.telemetry?.cache_status === 'reported');
 const hit = cacheKnown.reduce((n, row) => n + (row.telemetry.usage.prompt_tokens_details?.cached_tokens ?? 0), 0);
 const prompt = cacheKnown.reduce((n, row) => n + row.telemetry.usage.prompt_tokens, 0);
@@ -43,8 +42,7 @@ console.log(JSON.stringify({ scope: hash ?? `latest ${limit} Bridge requests`,
   medianFirstThinkingMs: p50(attempts.map(row => row.telemetry?.first_client_thinking_ms)),
   medianRequestMs: p50(attempts.map(row => row.elapsed_ms)),
   tokenUsage: { reportedRequests: reported.length, unavailableRequests: attempts.length - reported.length,
-    promptTokens: tokens('prompt_tokens'), completionTokens: tokens('completion_tokens'),
-    reasoningTokens: reported.reduce((n, row) => n + (row.telemetry.usage.completion_tokens_details?.reasoning_tokens ?? 0), 0),
+    ...requestTokenAccounting(rows),
     medianOutputTokensPerSecond: p50(reported.map(row => row.telemetry?.output_tokens_per_second)) },
   cacheHitRatio: cacheKnown.length === attempts.length && prompt > 0 ? hit / prompt : null,
   sessionPrefixCacheEstimate: estimatedPrompt > 0
@@ -57,5 +55,6 @@ console.log(JSON.stringify({ scope: hash ?? `latest ${limit} Bridge requests`,
   note: 'Tokens: Qoder context_usage_ratio x policy window (prompt) and streamed token deltas (output, reasoning ' +
     'included). Qoder reports no cache counts: billingDerivedCache solves each bill against the published DeepSeek ' +
     'tariff (an inference), the prefix figure is an estimate, and local replay is not a provider cache hit. Peak tier ' +
-    '(Beijing weekdays 9-12, 14-18) costs twice off-peak. Credits are recorded consumption. Unavailable data stays null.',
+    '(Beijing weekdays 9-12, 14-18) costs twice off-peak. Credits are SDK-reported, not an independently verified account bill. ' +
+    'Unavailable totals stay null; known token subtotals retain observed output from guarded/interrupted attempts when reliable.',
 }, null, 2));

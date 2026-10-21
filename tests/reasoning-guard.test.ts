@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { QoderPool } from '../src/pool.js';
 import { ChatRequest } from '../src/compat.js';
 import type { Config } from '../src/client.js';
+import type {UsageAccounting} from '../src/usage.js';
 
 const zero = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
 const request = ChatRequest.parse({ model: 'qoder-deepseek-flash', prompt_cache_key: 'guard-session',
@@ -68,6 +69,11 @@ test('runaway reasoning is interrupted and retried once at high effort in the sa
     assert.equal(usage.prompt_tokens, 513);
     assert.ok(usage.completion_tokens >= 1024 + 4 && usage.completion_tokens <= 1100 + 4);
     assert.equal(usage.completion_tokens_details.reasoning_tokens, usage.completion_tokens - 3);
+    const accounting=report.usage_accounting as UsageAccounting;
+    assert.ok(accounting);
+    assert.equal(accounting?.prompt_tokens,null);
+    assert.equal(accounting?.completion_tokens,usage.completion_tokens);
+    assert.equal(accounting?.reasoning_tokens,usage.completion_tokens_details.reasoning_tokens);
     assert.equal(pool.stats().sessions, 1, 'an interrupted turn keeps its Qoder session');
     assert.equal(pool.stats().reasoning_guard.trips, 1);
   } finally { pool.closeAll(); }

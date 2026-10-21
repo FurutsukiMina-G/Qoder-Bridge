@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ChatRequest, Decision } from './compat.js';
 import {recoverySummary,type RecoveryTrace} from './decision-recovery.js';
 import type { bridgeFailure, SDKExceptionDetails } from './failures.js';
+import type {UsageAccounting} from './usage.js';
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 export function sessionKeyHash(key: string | undefined): string | null {
@@ -38,6 +39,7 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   context_reset?:unknown;prompt_optimization?:{contract_reused:boolean;echo_characters_avoided:number};
   failure?: ReturnType<typeof bridgeFailure> | null;
   sdk_error_code?: number | string | null; sdk_exception?: SDKExceptionDetails | null;
+  usage_accounting?:UsageAccounting;
 };
 export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision?: Decision;
   bridgeRequestId: string; startedAt: number; error?: string; bridgePort?: number; }) {
@@ -88,6 +90,7 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       first_client_thinking_ms: turn?.first_client_thinking_ms ?? null, stream_chunks: turn?.stream_chunks ?? 0,
       local_response_replay: turn?.local_response_replay ?? false,
       usage: turn?.normalized_usage ?? null, usage_source: turn?.normalized_usage_source ?? 'unavailable',
+      usage_accounting:turn?.usage_accounting??null,
       // Exactly what the Harness received; may carry the opt-in cache estimate that `usage` never does.
       client_usage: turn?.client_usage ?? null, client_cache_usage: turn?.client_cache_usage ?? 'omitted',
       reasoning_tokens: turn?.reasoning_tokens ?? null, output_tokens_per_second: turn?.output_tokens_per_second ?? null,

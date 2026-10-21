@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {parseDecision,toolDefinitions,type ChatRequest,type Decision,type DecisionRepair} from './compat.js';
 import {safeError} from './telemetry.js';
-import {sumOpenAIUsage,type OpenAIUsage} from './usage.js';
+import {sumOpenAIUsage,usageAccounting,type UsageAccounting,type OpenAIUsage} from './usage.js';
 
 export const MAX_DECISION_RETRIES = 2;
 export function decisionRetryLimit(value: number | undefined) {
@@ -22,6 +22,7 @@ export type RecoveryTurn = {
   reasoning_guard_stopped?: boolean;
   /** Output deltas observed even when the attempt never reported a context ratio (e.g. interrupted). */
   streamed_output_tokens?: number; streamed_reasoning_tokens?: number;
+  streamed_token_deltas_reliable?:boolean;usage_accounting?:UsageAccounting;
 };
 export type RecoveryOutcome = 'not_needed' | 'recovered' | 'exhausted' | 'repeated_invalid_decision' |
   'upstream_failure' | 'output_budget' | 'empty_response' | 'cancelled' | 'already_streamed' | 'stream_conflict' | 'disabled' |
@@ -31,7 +32,7 @@ export type RecoveryTrace = {
   knownCreditsSubtotal: number; unknownCreditAttempts: number;
   evidence: Array<{attempt: number; promptChars: number; promptSha256: string; response: string; responseSha256: string;
     validationError: string | null; stage: string; upstreamError: string | null; stopReasons: string[];
-    credits: number | null; usage: OpenAIUsage | null; usageSource: string; modelRequests: number | null}>;
+    credits: number | null; usage: OpenAIUsage | null; usageSource: string; modelRequests: number | null;usageAccounting?:UsageAccounting}>;
 };
 export type RecoveryResult<T extends RecoveryTurn> = {turn: T; decision: Decision | null; decisionError: string | null; recovery: RecoveryTrace};
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -72,25 +73,17 @@ const REASONING_BUDGET_PROMPT = 'BRIDGE NOTE. The previous attempt was stopped a
  * Hosts read the latest call's usage as the current context size, so a multi-attempt request reports the final
  * attempt's prompt (and its cache split) with all generated output. The summed accounting stays in normalized_usage.
  */
-function contextUsage(turns: RecoveryTurn[]): OpenAIUsage | null {
-  const last = [...turns].reverse().map(t => t.client_usage ?? t.normalized_usage).find(Boolean);
-  if (!last) return null;
-  let completion = 0, reasoning = 0, reasoningKnown = true;
-  for (const t of turns) {
-    const usage = t.client_usage ?? t.normalized_usage;
-    if (usage) {
-      completion += usage.completion_tokens;
-      const value = usage.completion_tokens_details?.reasoning_tokens;
-      if (typeof value === 'number') reasoning += value; else reasoningKnown = false;
-    } else if (typeof t.streamed_output_tokens === 'number') {
-      completion += t.streamed_output_tokens;
-      if (typeof t.streamed_reasoning_tokens === 'number') reasoning += t.streamed_reasoning_tokens; else reasoningKnown = false;
-    } else return null;
-  }
+function contextUsage(turns: RecoveryTurn[],accounting:UsageAccounting): OpenAIUsage | null {
+  const tail=turns.at(-1),last=tail?.client_usage??tail?.normalized_usage;
+  if (!last || accounting.completion_tokens===null) return null;
+  const completion=accounting.completion_tokens;
   return { prompt_tokens: last.prompt_tokens, completion_tokens: completion, total_tokens: last.prompt_tokens + completion,
     ...(last.prompt_tokens_details ? { prompt_tokens_details: { ...last.prompt_tokens_details } } : {}),
-    ...(reasoningKnown ? { completion_tokens_details: { reasoning_tokens: reasoning } } : {}) };
+    ...(accounting.reasoning_tokens!==null ? { completion_tokens_details: { reasoning_tokens: accounting.reasoning_tokens } } : {}) };
 }
+function accountTurns(turns:RecoveryTurn[]){return usageAccounting(turns.map(t=>({usage:t.normalized_usage,
+  source:t.normalized_usage_source,streamedOutputTokens:t.streamed_output_tokens,streamedReasoningTokens:t.streamed_reasoning_tokens,
+  streamedReliable:t.streamed_token_deltas_reliable})))}
 
 /** Runtime/auth/quota/permission/cancellation/output budgets never enter the format correction loop. */
 function terminal<T extends RecoveryTurn>(turn: T, signal?: AbortSignal): RecoveryOutcome | null {
@@ -116,6 +109,7 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
   for (let attempt=0;;attempt++) {
     options.signal?.throwIfAborted();
     const turn=await options.invoke(prompt,attempt,correctionSchemaCharacters);turns.push(turn);trace.attempts++;
+    turn.usage_accounting=accountTurns([turn]);
     if (attempt>0) trace.correctionCalls++;
     let streamConflict=false;
     const repairs:DecisionRepair[]=[];
@@ -135,7 +129,7 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
     trace.evidence.push({attempt:attempt+1,promptChars:prompt.length,promptSha256:hash(prompt),response:turn.response,
       responseSha256:hash(turn.response),validationError:decisionError,stage:turn.stage,upstreamError:turn.error,
       stopReasons:turn.stream_stop_reasons??[],credits:turn.credits_delta??null,usage:turn.normalized_usage??null,
-      usageSource:turn.normalized_usage_source??'unavailable',modelRequests:turn.model_requests??null});
+      usageSource:turn.normalized_usage_source??'unavailable',modelRequests:turn.model_requests??null,usageAccounting:turn.usage_accounting});
     if (decision) {trace.outcome=attempt?'recovered':'not_needed';break;}
     if (blocked) {trace.outcome=blocked;break;}
     if (stopped) {
@@ -161,16 +155,17 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
   const sum=(field:keyof RecoveryTurn) => turns.every(t=>typeof t[field]==='number')
     ? turns.reduce((n,t)=>n+(t[field] as number),0):null;
   const usage=sumOpenAIUsage(turns.map(t=>t.normalized_usage));
-  const clientUsage=contextUsage(turns);
+  const accounting=accountTurns(turns),clientUsage=contextUsage(turns,accounting);
   const usageSources=[...new Set(turns.map(t=>t.normalized_usage_source??'unavailable'))];
   const allUsageReported=usageSources.every(source=>['result','stream_events','assistant'].includes(source));
   const merged={...last,wall_ms:sum('wall_ms'),api_ms:sum('api_ms'),sdk_wall_ms:sum('sdk_wall_ms'),
     credits_delta:trace.unknownCreditAttempts?null:trace.knownCreditsSubtotal,
     model_requests:sum('model_requests'),prompt_chars:turns.reduce((n,t)=>n+(t.prompt_chars??0),0),
     normalized_usage:usage,client_usage:clientUsage,
+    usage_accounting:accounting,
     normalized_usage_source:usage?(allUsageReported?'sum_of_reported_decision_attempts':'sum_including_estimated_decision_attempts'):'unavailable',
     normalized_usage_sources:usageSources,
-    reasoning_tokens:usage?.completion_tokens_details?.reasoning_tokens??null,
+    reasoning_tokens:accounting.reasoning_tokens,
     output_tokens_per_second:null,
     cache_estimate_tokens:sum('cache_estimate_tokens'),
     cache_estimate_ratio:usage&&usage.prompt_tokens>0&&sum('cache_estimate_tokens')!==null?sum('cache_estimate_tokens')!/usage.prompt_tokens:null,
