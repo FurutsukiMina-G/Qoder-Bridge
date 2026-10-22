@@ -349,6 +349,10 @@ test('a supplied tool discriminator retains one complete packed arguments object
   assert.deepEqual(parseDecision(JSON.stringify({ kind: 'read', arguments: args }), readRequest,
     repair => repairs.push(repair)), { kind: 'tool_call', name: 'read', arguments: args });
   assert.deepEqual(repairs, [{ kind: 'flat_tool_kind', tool: 'read', parameter: 'kind' }]);
+  const withMatchingName: DecisionRepair[] = [];
+  assert.deepEqual(parseDecision(JSON.stringify({ kind: 'read', name: 'read', arguments: args }), readRequest,
+    repair => withMatchingName.push(repair)), { kind: 'tool_call', name: 'read', arguments: args });
+  assert.deepEqual(withMatchingName, [{ kind: 'flat_tool_kind', tool: 'read', parameter: 'kind' }]);
   const ownArguments = ChatRequest.parse({ ...request, tools: [{ type: 'function', function: {
     name: 'store', parameters: { type: 'object', properties: { arguments: { type: 'object' } },
       required: ['arguments'], additionalProperties: false },
@@ -367,6 +371,8 @@ test('packed tool discriminators keep complete boundaries, schema and tool-choic
     { kind: 'read', arguments: { file_path: 'file.py' }, offset: 200 },
     { kind: 'read', arguments: [{ file_path: 'file.py' }] },
     { kind: 'read', arguments: '{"file_path":"file.py"}' },
+    { kind: 'read', name: 'grep', arguments: { file_path: 'file.py' } },
+    { kind: 'read', name: 'read', arguments: { file_path: 'file.py' }, extra: true },
   ]) {
     const repairs: DecisionRepair[] = [];
     assert.throws(() => parseDecision(JSON.stringify(source), readRequest, repair => repairs.push(repair)));

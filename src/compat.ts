@@ -333,6 +333,8 @@ function invocationEnd(fragment: string): number | null {
         catch { return null; }
       }
     }
+    const bareInvokeClose = /^\s*｜｜DSML｜｜\s*invoke\s*>/.exec(fragment.slice(tokens.lastIndex));
+    if (bareInvokeClose) return tokens.lastIndex + bareInvokeClose[0].length;
   }
   return null;
 }
@@ -682,10 +684,13 @@ function decisionObject(value: unknown, request: ChatRequest, repairs: DecisionR
     const schema = provided.length === 1 ? provided[0]!.function.parameters as
       { properties?: Record<string, unknown> } | undefined : undefined;
     const keys = Object.keys(row).filter(key => key !== 'kind');
+    const sameName = !keys.includes('name') ||
+      (row.name === row.kind && Boolean(schema?.properties && !Object.hasOwn(schema.properties, 'name')));
+    const argKeys = keys.filter(key => key !== 'name');
     // This observed form explicitly uses a provided tool as the discriminator.
     // It can carry declared flat fields or one complete arguments object.
     // Never unwrap a tool's own parameter named arguments or mix both forms.
-    const packed = keys.length === 1 && keys[0] === 'arguments' && schema?.properties &&
+    const packed = sameName && argKeys.length === 1 && argKeys[0] === 'arguments' && schema?.properties &&
       !Object.hasOwn(schema.properties, 'arguments') && row.arguments !== null &&
       typeof row.arguments === 'object' && !Array.isArray(row.arguments);
     if (schema?.properties && !Object.hasOwn(schema.properties, 'kind') &&

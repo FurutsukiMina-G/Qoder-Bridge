@@ -9,6 +9,16 @@ test('a named next-call opener with one stray slash is recovered only after the 
   const repairs:DecisionRepair[]=[];
   assert.deepEqual(parseDecision(source,request,r=>repairs.push(r)),{kind:'tool_calls',calls:[{name:'read',arguments:{file_path:'first.txt'}},{name:'read',arguments:{file_path:'中文 second.txt',offset:12}}]});
   assert.deepEqual(repairs,[{kind:'misclosed_invoke_opener',tool:'read',parameter:'call'}]);
+  const bareClose=`<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="read">${p('first.txt')}\n｜｜DSML｜｜ invoke>\n`+
+    `<｜｜DSML｜｜ invoke name="read">${p('second.txt')}\n｜｜DSML｜｜ invoke>\n`+
+    `</｜｜DSML｜｜ invoke name="read">${p('third.txt')}\n｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>`;
+  const bareRepairs:DecisionRepair[]=[];
+  assert.deepEqual(parseDecision(bareClose,request,r=>bareRepairs.push(r)),{kind:'tool_calls',calls:[
+    {name:'read',arguments:{file_path:'first.txt'}},
+    {name:'read',arguments:{file_path:'second.txt'}},
+    {name:'read',arguments:{file_path:'third.txt'}},
+  ]});
+  assert.deepEqual(bareRepairs,[{kind:'misclosed_invoke_opener',tool:'read',parameter:'call'}]);
 });
 test('unknown names, incomplete boundaries, extra data and invalid arguments still reject the whole batch',()=>{
   const cut=source.indexOf('</｜｜DSML｜｜ invoke>');
