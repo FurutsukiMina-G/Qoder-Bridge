@@ -294,8 +294,8 @@ export class QoderPool {
           const deltaCredits = regressed ? null : total === null ? report.credits : total - (record.lastCredits ?? 0);
           if (total !== null && !regressed) record.lastCredits = total;
           else if (total === null && report.credits !== null) record.lastCredits = (record.lastCredits ?? 0) + report.credits;
-          const billedCredits = report.stream_original_credits ?? deltaCredits;
-          const billing = measured && typeof billedCredits === 'number' && report.stream_billable !== false
+          const billedCredits = report.stream_original_credits ?? (report.stream_billable !== false ? deltaCredits : null);
+          const billing = measured && typeof billedCredits === 'number'
             ? cacheFromCredits({ model: record.model, promptTokens: measured.prompt_tokens,
               outputTokens: measured.completion_tokens, credits: billedCredits, at: attemptAt, prefixHint: previousPrompt }) : null;
           const cacheMode = this.config.cacheUsage ?? 'none';
@@ -357,6 +357,7 @@ export class QoderPool {
         credits_delta_source:recovery.attempts>1?'sum_of_decision_attempts':turn.credits_delta_source,
         sent_tool_definition_chars:attemptReports.reduce((n,r)=>n+(r.sent_tool_definition_chars as number),0),
         model_policy_calls:attemptReports.flatMap(r=>r.model_policy_calls as unknown[]),
+        assistant_messages:attemptReports.reduce((n,r)=>n+(r.assistant_messages as number),0),
         requests:attemptReports.flatMap(r=>r.requests as unknown[]),
         api_retries:attemptReports.reduce((n,r)=>n+(r.api_retries as number),0),
         api_retry_details:attemptReports.flatMap(r=>r.api_retry_details as unknown[]),

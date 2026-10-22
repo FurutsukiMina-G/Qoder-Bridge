@@ -165,7 +165,9 @@ export class Telemetry {
       sdk_errors: this.result && 'errors' in this.result ? this.result.errors.map(safeError) : [],
       sdk_error_code: sdkErrorCode(this.result?.error_code) ?? this.exception?.result_error_code ?? null,
       sdk_exception: this.exception,
-      model_requests: rows.length || null, model_request_count_source: 'unique assistant request/message IDs',
+      model_requests: Math.max(rows.length, streams.length) || null,
+      model_request_count_source: rows.length ? 'unique assistant request/message IDs'
+        : streams.length ? 'stream message_start/delta events' : 'unique assistant request/message IDs',
       policy_calls: this.policyCalls, assistant_messages: rows.length, api_retries: this.apiRetries,
       api_retry_details: [...this.apiRetryDetails], api_error_categories: [...this.apiErrorCategories],
       model_queue_statuses: [...this.modelQueueStatuses],

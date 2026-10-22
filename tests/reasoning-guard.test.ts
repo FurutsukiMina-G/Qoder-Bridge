@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { QoderPool } from '../src/pool.js';
 import { ChatRequest } from '../src/compat.js';
+import { sharedTierCalendar } from '../src/billing.js';
 import type { Config } from '../src/client.js';
 import type {UsageAccounting} from '../src/usage.js';
 
@@ -63,6 +64,7 @@ test('runaway reasoning is interrupted and retried once at high effort in the sa
     assert.ok(!fake.prompts[1]!.includes('Plan the next step'), 'the retry does not resend the conversation');
     const report = result.report as Record<string, unknown>;
     assert.equal(report.reasoning_guard_stops, 1);
+    assert.equal(report.model_requests, 2);
     assert.equal(report.requested_reasoning, 'high');
     // Final context with all generated output: 1,024+ interrupted thinking plus the retry's 1 thinking + 3 text tokens.
     const usage = report.client_usage as { prompt_tokens: number; completion_tokens: number; completion_tokens_details: { reasoning_tokens: number } };
@@ -98,5 +100,38 @@ test('an identical retry after the reasoning budget is exhausted replays the fai
     const again = await pool.infer(request);
     assert.equal(again.report.stage, 'local_rejected_replay');
     assert.equal(fake.prompts.length, 1, 'the identical request did not reach the model again');
+  } finally { pool.closeAll(); }
+});
+test('non-billable package turns still invert list-price stream original_credits into cache hits', async () => {
+  const fake = runawayRecord(10);
+  // 10,000 prompt tokens with 9,000 cached + 4 output tokens at peak (2x) list price:
+  // 22.22 * 2 * (1*1000 + 0.02*9000 + 4*4) / 1e6 = 0.05315024, or off-peak (1x) = 0.02657512.
+  fake.record.queue.push = (message: { message: { content: string } }) => {
+    fake.prompts.push(message.message.content);
+    fake.record.policyCalls.push({ purpose: 'main', model: 'dfmodel', context_window: 1_000_000, reasoning_effort: 'max' });
+    const mult = sharedTierCalendar.tier(new Date()) === 'peak' ? 2 : 1;
+    const listCredits = 22.22 * mult * (1 * 1000 + 0.02 * 9000 + 4 * 4) / 1e6;
+    (fake.record.q.next as unknown) = (() => {
+      const steps = [
+        event({ type: 'message_start', message: { id: 'm-pkg', usage: zero } }),
+        delta({ type: 'thinking_delta', thinking: 'ok' }),
+        ...['{"kind":"final",', '"content":', '"OK"}'].map(text => delta({ type: 'text_delta', text })),
+        event({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { ...zero,
+          credits: listCredits, original_credits: listCredits, billable: false, context_usage_ratio: 0.01 } }),
+        { type: 'result', subtype: 'success', is_error: false, session_id: 'sdk', total_credits: 0, usage: zero, modelUsage: {} },
+      ];
+      return async () => ({ done: false, value: steps.shift() });
+    })();
+  };
+  const pool = poolWith({ cacheUsage: 'billing', reasoningGuardTokens: 0 }, fake.record);
+  try {
+    const result = await pool.infer(request);
+    const report = result.report as Record<string, unknown>;
+    assert.equal(report.stream_billable, false);
+    assert.equal(report.credits_delta, 0);
+    assert.equal(report.client_cache_usage, 'credits_inverse');
+    assert.equal((report.cache_billing as { cachedTokens: number })?.cachedTokens, 9000);
+    assert.equal((report.client_usage as { prompt_tokens_details?: { cached_tokens: number } })
+      ?.prompt_tokens_details?.cached_tokens, 9000);
   } finally { pool.closeAll(); }
 });
