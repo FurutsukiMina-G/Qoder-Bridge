@@ -195,7 +195,8 @@ export class QoderPool {
       // (including an explicit new user message) can start a new decision.
       if(record.lastFailedDecision?.hash===requestHash){
         const failed=record.lastFailedDecision;
-        const localRecovery={...failed.recovery,correctionCalls:0,attempts:0,evidence:[],knownCreditsSubtotal:0,unknownCreditAttempts:0};
+        const localRecovery={...failed.recovery,correctionCalls:0,attempts:0,evidence:[],knownCreditsSubtotal:0,unknownCreditAttempts:0,
+          knownModelRequestsSubtotal:0,unknownModelRequestAttempts:0};
         return {record,decision:null,decisionError:failed.error,response:failed.response,completionId:undefined,
           recovery:localRecovery,report:{...new Telemetry().snapshot(),response:failed.response,
             error:null as string|null,stage:'local_rejected_replay',model:record.model,

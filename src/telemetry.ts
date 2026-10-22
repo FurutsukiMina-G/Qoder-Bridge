@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import type { SDKMessage, SDKAssistantMessage, SDKResultMessage } from '@qodercn-ai/qodercn-agent-sdk';
 import { aggregateUsage, measuredUsage, reportedUsage, tokenDeltasReliable, type StreamTokens } from './usage.js';
 import { sdkErrorCode, sdkExceptionDetails, type SDKExceptionDetails } from './failures.js';
+import {ModelResponseCounter} from './response-counts.js';
 const API_ERROR_CODES = new Set(['authentication_failed', 'billing_error', 'rate_limit', 'invalid_request',
   'server_error', 'unknown', 'max_output_tokens']);
 const apiErrorCode = (value: unknown) => typeof value === 'string' && API_ERROR_CODES.has(value) ? value : 'unknown';
@@ -26,6 +27,7 @@ export class Telemetry {
   lastDeltaMs: number | null = null;
   private streamUsage = new Map<string, Record<string, unknown>>();
   private streamTokens = new Map<string, StreamTokens>();
+  private responseCounter=new ModelResponseCounter();
   private streamKey = 'stream-0';
   private unstreamedText = false;
   private streamStopReasons = new Set<string>();
@@ -58,6 +60,7 @@ export class Telemetry {
       this.init = { tools: message.tools, skills: message.skills, plugins: message.plugins };
     }
     if (message.type === 'system' && message.subtype === 'api_retry') {
+      this.responseCounter.retry();
       this.apiRetries++;
       this.apiRetryDetails.push({ attempt: message.attempt, max_retries: message.max_retries,
         retry_delay_ms: message.retry_delay_ms, error_status: message.error_status, error: apiErrorCode(message.error) });
@@ -81,10 +84,12 @@ export class Telemetry {
       const event = message.event as unknown as { type: string; message?: { id?: string; usage?: Record<string, unknown> };
         usage?: Record<string, unknown>; delta?: { type?: string; text?: string; thinking?: string; stop_reason?: unknown } };
       if (event.type === 'message_start') {
+        this.responseCounter.streamStart(event.message?.id);
         this.streamKey = event.message?.id ?? `stream-${this.streamTokens.size}`;
         this.tokens();
         if (event.message?.usage) this.streamUsage.set(this.streamKey, { ...event.message.usage });
       }
+      if(event.type==='content_block_delta'||event.type==='message_delta')this.responseCounter.streamActivity();
       if (event.type === 'message_delta' && event.usage)
         this.streamUsage.set(this.streamKey, { ...this.streamUsage.get(this.streamKey), ...event.usage });
       const ratio = this.streamUsage.get(this.streamKey)?.context_usage_ratio;
@@ -109,6 +114,7 @@ export class Telemetry {
         !['text_delta', 'thinking_delta', 'signature_delta'].includes(delta.type)) this.tokens().foreignDeltas++;
     }
     if (message.type === 'assistant' && !message.isApiErrorMessage) {
+      this.responseCounter.assistant(message.request_id,message.message.id);
       const key = message.request_id ?? message.message.id ?? message.uuid;
       const seen = this.assistants.has(key);
       this.assistants.set(key, message);
@@ -165,9 +171,7 @@ export class Telemetry {
       sdk_errors: this.result && 'errors' in this.result ? this.result.errors.map(safeError) : [],
       sdk_error_code: sdkErrorCode(this.result?.error_code) ?? this.exception?.result_error_code ?? null,
       sdk_exception: this.exception,
-      model_requests: Math.max(rows.length, streams.length) || null,
-      model_request_count_source: rows.length ? 'unique assistant request/message IDs'
-        : streams.length ? 'stream message_start/delta events' : 'unique assistant request/message IDs',
+      ...this.responseCounter.snapshot(),
       policy_calls: this.policyCalls, assistant_messages: rows.length, api_retries: this.apiRetries,
       api_retry_details: [...this.apiRetryDetails], api_error_categories: [...this.apiErrorCategories],
       model_queue_statuses: [...this.modelQueueStatuses],

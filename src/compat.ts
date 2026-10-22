@@ -302,11 +302,15 @@ function repairParameterMarkers(fragment: string, tool: string, request: ChatReq
 }
 function invocationEnd(fragment: string): number | null {
   const tokens = /<｜｜DSML｜｜\s*parameter\s+name="([^"]+)"[^>]*>|<\/｜｜DSML｜｜\s*invoke\s*>/g;
-  let token: RegExpExecArray | null;
-  while ((token = tokens.exec(fragment))) {
-    if (token[1] === undefined) return tokens.lastIndex;
+  let carried: {name:string;header:string} | null=null;
+  while (true) {
+    const token:RegExpExecArray|null=carried?null:tokens.exec(fragment);
+    const field: {name:string|undefined;header:string}|null=carried??(token?{name:token[1],header:token[0]}:null);
+    carried=null;
+    if(!field)return null;
+    if (field.name === undefined) return tokens.lastIndex;
     const valueStart = tokens.lastIndex;
-    if (token[1] === 'arguments') {
+    if (field.name === 'arguments') {
       const start = fragment.indexOf('{', valueStart);
       if (start >= 0) {
         try { tokens.lastIndex = objectRange(fragment, start).end; continue; }
@@ -321,22 +325,21 @@ function invocationEnd(fragment: string): number | null {
     // parsing. Recognise it for invocation boundaries only after an explicit
     // non-string tag and a whole JSON primitive; never finish a value or
     // reinterpret a marker inside a string/JSON object.
-    if (bare && (!closing || bare.index < closing.index) && /\bstring="false"/.test(token[0]) &&
+    if (bare && (!closing || bare.index < closing.index) && /\bstring="false"/.test(field.header) &&
         /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)$/.test(remainder.slice(0, bare.index).trim()))
       closing = bare;
     if (!closing) return null;
     tokens.lastIndex = valueStart + closing.index + closing[0].length;
-    if (token[1] === 'name' && /^<\/｜｜DSML｜｜\s*parameter\s+name="arguments"\s+string="false"\s*>$/.test(closing[0])) {
-      const start = fragment.indexOf('{', tokens.lastIndex);
-      if (start >= 0 && !fragment.slice(tokens.lastIndex, start).trim()) {
-        try { tokens.lastIndex = objectRange(fragment, start).end; }
-        catch { return null; }
-      }
+    const next=/^<\/｜｜DSML｜｜\s*parameter\s+name="([^"]+)"(?:\s+string="(?:true|false)")?\s*>$/.exec(closing[0]);
+    if(next){
+      // This close also explicitly opens the next parameter. We are inside its value,
+      // so consume that opaque value before considering a bare invocation terminator.
+      carried={name:next[1]!,header:closing[0]};
+      continue;
     }
     const bareInvokeClose = /^\s*｜｜DSML｜｜\s*invoke\s*>/.exec(fragment.slice(tokens.lastIndex));
     if (bareInvokeClose) return tokens.lastIndex + bareInvokeClose[0].length;
   }
-  return null;
 }
 function unwrappedCalls(tail: string, repairs: DecisionRepair[], request: ChatRequest, owner = 'wrapper'): Array<{ name: string; arguments: unknown }> {
   if (/^\s*<｜｜DSML｜｜\s*parameter\s+name="tool_calls">\s*(?:<\/｜｜DSML｜｜\s*(?:calls|tool_calls)>\s*)?$/.test(tail) &&

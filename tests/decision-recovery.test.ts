@@ -143,6 +143,7 @@ test('exhausted identical HTTP retries do not start another paid loop; a changed
     const first=await pool.infer(req);assert.equal(first.decision,null);assert.equal(prompts.length,3);
     const retry=await pool.infer(req);assert.equal(prompts.length,3);assert.equal(retry.report.credits_delta,0);
     assert.equal(retry.report.model_requests,0);assert.equal(retry.report.stage,'local_rejected_replay');
+    assert.equal(retry.report.model_requests_known,0);assert.equal(retry.recovery?.knownModelRequestsSubtotal,0);
     assert.equal(retry.recovery!.attempts,0);
     const changed=await pool.infer({...req,messages:[...req.messages,{role:'user',content:'Continue after reviewing the schema.'}]});
     assert.deepEqual(changed.decision,good);assert.equal(prompts.length,4);

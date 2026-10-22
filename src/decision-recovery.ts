@@ -17,6 +17,7 @@ export type RecoveryTurn = {
   client_usage?: OpenAIUsage | null; credits_delta?: number | null;
   wall_ms?: number | null; api_ms?: number | null; sdk_wall_ms?: number | null;
   model_requests?: number | null; prompt_chars?: number; decision_repairs?: DecisionRepair[];
+  model_requests_known?:number;model_request_count_source?:string;unidentified_response_events?:number;
   cache_estimate_tokens?: number | null;
   /** The bridge interrupted this attempt for reasoning past its budget before any output; nothing ran. */
   reasoning_guard_stopped?: boolean;
@@ -30,9 +31,10 @@ export type RecoveryOutcome = 'not_needed' | 'recovered' | 'exhausted' | 'repeat
 export type RecoveryTrace = {
   maxCorrectionCalls: number; correctionCalls: number; attempts: number; outcome: RecoveryOutcome;
   knownCreditsSubtotal: number; unknownCreditAttempts: number;
+  knownModelRequestsSubtotal:number;unknownModelRequestAttempts:number;
   evidence: Array<{attempt: number; promptChars: number; promptSha256: string; response: string; responseSha256: string;
     validationError: string | null; stage: string; upstreamError: string | null; stopReasons: string[];
-    credits: number | null; usage: OpenAIUsage | null; usageSource: string; modelRequests: number | null;usageAccounting?:UsageAccounting}>;
+    credits: number | null; usage: OpenAIUsage | null; usageSource: string; modelRequests: number | null;usageAccounting?:UsageAccounting;modelRequestsKnown?:number}>;
 };
 export type RecoveryResult<T extends RecoveryTurn> = {turn: T; decision: Decision | null; decisionError: string | null; recovery: RecoveryTrace};
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -102,7 +104,8 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
   prepareRetry?: () => boolean; validateDecision?: (decision: Decision) => void;
 }): Promise<RecoveryResult<T>> {
   const limit = decisionRetryLimit(options.retries);
-  const trace: RecoveryTrace = {maxCorrectionCalls:limit,correctionCalls:0,attempts:0,outcome:'not_needed',knownCreditsSubtotal:0,unknownCreditAttempts:0,evidence:[]};
+  const trace: RecoveryTrace = {maxCorrectionCalls:limit,correctionCalls:0,attempts:0,outcome:'not_needed',knownCreditsSubtotal:0,unknownCreditAttempts:0,
+    knownModelRequestsSubtotal:0,unknownModelRequestAttempts:0,evidence:[]};
   const turns:T[]=[];
   let prompt=options.prompt,correctionSchemaCharacters=0,decision:Decision|null=null,decisionError:string|null=null;
   const rejected = new Set<string>();
@@ -126,10 +129,13 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
     turn.decision_repairs=repairs;
     if (typeof turn.credits_delta==='number') trace.knownCreditsSubtotal+=turn.credits_delta;
     else trace.unknownCreditAttempts++;
+    const complete=Number.isSafeInteger(turn.model_requests)&&turn.model_requests!>=0;
+    const knownModels=complete?turn.model_requests!:Number.isSafeInteger(turn.model_requests_known)&&turn.model_requests_known!>=0?turn.model_requests_known!:0;
+    trace.knownModelRequestsSubtotal+=knownModels;if(!complete)trace.unknownModelRequestAttempts++;
     trace.evidence.push({attempt:attempt+1,promptChars:prompt.length,promptSha256:hash(prompt),response:turn.response,
       responseSha256:hash(turn.response),validationError:decisionError,stage:turn.stage,upstreamError:turn.error,
       stopReasons:turn.stream_stop_reasons??[],credits:turn.credits_delta??null,usage:turn.normalized_usage??null,
-      usageSource:turn.normalized_usage_source??'unavailable',modelRequests:turn.model_requests??null,usageAccounting:turn.usage_accounting});
+      usageSource:turn.normalized_usage_source??'unavailable',modelRequests:turn.model_requests??null,usageAccounting:turn.usage_accounting,modelRequestsKnown:knownModels});
     if (decision) {trace.outcome=attempt?'recovered':'not_needed';break;}
     if (blocked) {trace.outcome=blocked;break;}
     if (stopped) {
@@ -161,6 +167,9 @@ export async function recoverDecision<T extends RecoveryTurn>(options: {
   const merged={...last,wall_ms:sum('wall_ms'),api_ms:sum('api_ms'),sdk_wall_ms:sum('sdk_wall_ms'),
     credits_delta:trace.unknownCreditAttempts?null:trace.knownCreditsSubtotal,
     model_requests:sum('model_requests'),prompt_chars:turns.reduce((n,t)=>n+(t.prompt_chars??0),0),
+    model_requests_known:trace.knownModelRequestsSubtotal,
+    model_request_count_source:trace.unknownModelRequestAttempts?'partial sum of per-attempt response IDs':'sum of per-attempt response IDs',
+    unidentified_response_events:sum('unidentified_response_events'),
     normalized_usage:usage,client_usage:clientUsage,
     usage_accounting:accounting,
     normalized_usage_source:usage?(allUsageReported?'sum_of_reported_decision_attempts':'sum_including_estimated_decision_attempts'):'unavailable',

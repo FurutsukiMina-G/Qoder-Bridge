@@ -31,6 +31,7 @@ type Turn = { session_id?: string | null; model?: string | null; reused_session?
   api_retries?: number; api_retry_details?: unknown[]; api_error_categories?: string[]; model_queue_statuses?: unknown[];
   decision_recovery?: RecoveryTrace;
   model_requests?: number | null;
+  model_requests_known?:number;model_request_count_source?:string;unidentified_response_events?:number|null;
   cache_billing?: { cachedTokens: number; uncachedTokens: number; tier: string; calendarTier: string;
     residualTokens: number } | null;
   billing_tier?: string | null; requested_reasoning?: string | null;
@@ -86,6 +87,9 @@ export function taskLogEntry(args: { request: ChatRequest; turn?: Turn; decision
       upstream_failure:turn?.upstream_failure??null,
       failure:turn?.failure??null, sdk_error_code:turn?.sdk_error_code??null, sdk_exception:turn?.sdk_exception??null,
       model_requests:turn?.model_requests??null,
+      model_requests_known:turn?.model_requests_known??(typeof turn?.model_requests==='number'?turn.model_requests:turn?.decision_recovery?.knownModelRequestsSubtotal??null),
+      model_request_count_source:turn?.local_response_replay?'local_replay':turn?.model_request_count_source??'unavailable',
+      unidentified_response_events:turn?.unidentified_response_events??null,
       first_client_text_ms: turn?.first_client_text_ms ?? null,
       first_client_thinking_ms: turn?.first_client_thinking_ms ?? null, stream_chunks: turn?.stream_chunks ?? 0,
       local_response_replay: turn?.local_response_replay ?? false,

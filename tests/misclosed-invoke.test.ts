@@ -36,3 +36,13 @@ test('invoke-like text within an opaque parameter or JSON arguments is unchanged
   const packed=`<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="read"><｜｜DSML｜｜ parameter name="arguments" string="false">${JSON.stringify({file_path:literal})}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>`;
   assert.deepEqual(parseDecision(packed,request),{kind:'tool_call',name:'read',arguments:{file_path:literal}});
 });
+test('a carried parameter boundary cannot turn literal bare invoke text into a truncated edit',()=>{
+  const req=ChatRequest.parse({...request,tools:[{type:'function',function:{name:'edit',parameters:{type:'object',properties:{file_path:{type:'string'},old_string:{type:'string'},new_string:{type:'string'}},required:['file_path','old_string','new_string'],additionalProperties:false}}}]});
+  for(const replacement of ['｜｜DSML｜｜ invoke> COMPLETE_REPLACEMENT_TAIL','\n  ｜｜DSML｜｜ invoke>\n完整替换正文']){
+    const source='<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="edit">'+
+      '<｜｜DSML｜｜ parameter name="file_path" string="true">fixture.txt</｜｜DSML｜｜ parameter>'+
+      '<｜｜DSML｜｜ parameter name="old_string" string="true">before</｜｜DSML｜｜ parameter name="new_string" string="true">'+
+      replacement+'</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>';
+    assert.deepEqual(parseDecision(source,req),{kind:'tool_call',name:'edit',arguments:{file_path:'fixture.txt',old_string:'before',new_string:replacement}});
+  }
+});

@@ -101,7 +101,8 @@ npm.cmd run gate -- --path src/main.ts --strategy defer --json
 | `wall_ms` | 单轮从提交到终态的耗时，不含后续续接轮 |
 | `total_wall_ms` | 本次命令含启动、清理及可能的续接实验 |
 | `api_ms` / `sdk_wall_ms` | SDK Result 原样提供的 API/总耗时 |
-| `model_requests` | 按 request_id / assistant message.id / uuid 去重的响应请求数；不等于后台网络请求的绝对计数 |
+| `model_requests` | 关联流式 message ID 与 assistant 的 request/message ID 后去重的已观察响应数；标识缺失、关联不明或冲突时为 null，不等于全部后台网络请求数 |
+| `model_requests_known` | 总量未知时仍保留的已确认响应数小计；不能再与完整总数重复相加 |
 | `policy_calls` / `api_retries` | 调用前的模型策略计数 / SDK 重试事件 |
 | `requests` | 每个响应的 Tokens、Credits、original_credits、billable |
 | `total_session_credits` | Result 提供的会话累计 Credits，不能逐轮相加 |
